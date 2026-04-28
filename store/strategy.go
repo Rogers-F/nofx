@@ -161,6 +161,32 @@ func normalizeStrategyConfigPatch(patch map[string]any) {
 	if patch == nil {
 		return
 	}
+
+	if gridConfig, hasGrid := patch["grid_config"]; hasGrid && gridConfig != nil {
+		if _, hasType := patch["strategy_type"]; !hasType {
+			patch["strategy_type"] = "grid_trading"
+		}
+	}
+
+	aiKeys := []string{"coin_source", "indicators", "risk_control", "prompt_sections", "custom_prompt"}
+	for _, key := range aiKeys {
+		value, ok := patch[key]
+		if !ok {
+			continue
+		}
+		aiConfig, _ := patch["ai_config"].(map[string]any)
+		if aiConfig == nil {
+			aiConfig = map[string]any{}
+			patch["ai_config"] = aiConfig
+		}
+		aiConfig[key] = value
+		delete(patch, key)
+	}
+
+	if fmt.Sprint(patch["strategy_type"]) == "grid_trading" {
+		delete(patch, "ai_config")
+	}
+
 	if _, hasType := patch["strategy_type"]; hasType {
 		return
 	}
@@ -249,19 +275,128 @@ type StrategyConfig struct {
 	// language setting: "zh" for Chinese, "en" for English
 	// This determines the language used for data formatting and prompt generation
 	Language string `json:"language,omitempty"`
-	// coin source configuration
-	CoinSource CoinSourceConfig `json:"coin_source"`
-	// quantitative data configuration
-	Indicators IndicatorConfig `json:"indicators"`
-	// custom prompt (appended at the end)
-	CustomPrompt string `json:"custom_prompt,omitempty"`
-	// risk control configuration
-	RiskControl RiskControlConfig `json:"risk_control"`
-	// editable sections of System Prompt
-	PromptSections PromptSectionsConfig `json:"prompt_sections,omitempty"`
+	// AI trading configuration fields are kept on the Go struct for engine
+	// compatibility, but JSON persistence nests them under ai_config.
+	CoinSource     CoinSourceConfig     `json:"-"`
+	Indicators     IndicatorConfig      `json:"-"`
+	CustomPrompt   string               `json:"-"`
+	RiskControl    RiskControlConfig    `json:"-"`
+	PromptSections PromptSectionsConfig `json:"-"`
 
 	// Grid trading configuration (only used when StrategyType == "grid_trading")
 	GridConfig *GridStrategyConfig `json:"grid_config,omitempty"`
+
+	// Publish settings are shared by AI and grid strategies. The database still
+	// stores the authoritative booleans on Strategy, but config JSON may carry
+	// this object for agent/frontend schema consistency.
+	PublishConfig *PublishStrategyConfig `json:"publish_config,omitempty"`
+}
+
+// AIStrategyConfig contains fields only used by AI trading strategies.
+type AIStrategyConfig struct {
+	CoinSource     CoinSourceConfig     `json:"coin_source"`
+	Indicators     IndicatorConfig      `json:"indicators"`
+	CustomPrompt   string               `json:"custom_prompt,omitempty"`
+	RiskControl    RiskControlConfig    `json:"risk_control"`
+	PromptSections PromptSectionsConfig `json:"prompt_sections,omitempty"`
+}
+
+// PublishStrategyConfig contains settings shared by all strategy types.
+type PublishStrategyConfig struct {
+	IsPublic      bool `json:"is_public"`
+	ConfigVisible bool `json:"config_visible"`
+}
+
+// MarshalJSON writes the product-facing strategy schema:
+// strategy_type + grid_config or ai_config + shared publish_config.
+func (c StrategyConfig) MarshalJSON() ([]byte, error) {
+	strategyType := strings.TrimSpace(c.StrategyType)
+	if strategyType == "" {
+		strategyType = "ai_trading"
+	}
+
+	out := struct {
+		StrategyType  string                 `json:"strategy_type"`
+		Language      string                 `json:"language,omitempty"`
+		AIConfig      *AIStrategyConfig      `json:"ai_config,omitempty"`
+		GridConfig    *GridStrategyConfig    `json:"grid_config,omitempty"`
+		PublishConfig *PublishStrategyConfig `json:"publish_config,omitempty"`
+	}{
+		StrategyType:  strategyType,
+		Language:      c.Language,
+		PublishConfig: c.PublishConfig,
+	}
+
+	if strategyType == "grid_trading" {
+		out.GridConfig = c.GridConfig
+	} else {
+		out.AIConfig = &AIStrategyConfig{
+			CoinSource:     c.CoinSource,
+			Indicators:     c.Indicators,
+			CustomPrompt:   c.CustomPrompt,
+			RiskControl:    c.RiskControl,
+			PromptSections: c.PromptSections,
+		}
+	}
+
+	return json.Marshal(out)
+}
+
+// UnmarshalJSON accepts both the new nested schema and old flat configs. Old
+// top-level AI fields are normalized into the Go compatibility fields.
+func (c *StrategyConfig) UnmarshalJSON(data []byte) error {
+	type rawStrategyConfig struct {
+		StrategyType  string                 `json:"strategy_type"`
+		Language      string                 `json:"language"`
+		AIConfig      *AIStrategyConfig      `json:"ai_config"`
+		GridConfig    *GridStrategyConfig    `json:"grid_config"`
+		PublishConfig *PublishStrategyConfig `json:"publish_config"`
+
+		CoinSource     *CoinSourceConfig     `json:"coin_source"`
+		Indicators     *IndicatorConfig      `json:"indicators"`
+		CustomPrompt   *string               `json:"custom_prompt"`
+		RiskControl    *RiskControlConfig    `json:"risk_control"`
+		PromptSections *PromptSectionsConfig `json:"prompt_sections"`
+	}
+
+	var raw rawStrategyConfig
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	c.StrategyType = raw.StrategyType
+	c.Language = raw.Language
+	c.GridConfig = raw.GridConfig
+	c.PublishConfig = raw.PublishConfig
+
+	if raw.AIConfig != nil {
+		c.CoinSource = raw.AIConfig.CoinSource
+		c.Indicators = raw.AIConfig.Indicators
+		c.CustomPrompt = raw.AIConfig.CustomPrompt
+		c.RiskControl = raw.AIConfig.RiskControl
+		c.PromptSections = raw.AIConfig.PromptSections
+	} else {
+		if raw.CoinSource != nil {
+			c.CoinSource = *raw.CoinSource
+		}
+		if raw.Indicators != nil {
+			c.Indicators = *raw.Indicators
+		}
+		if raw.CustomPrompt != nil {
+			c.CustomPrompt = *raw.CustomPrompt
+		}
+		if raw.RiskControl != nil {
+			c.RiskControl = *raw.RiskControl
+		}
+		if raw.PromptSections != nil {
+			c.PromptSections = *raw.PromptSections
+		}
+	}
+
+	if strings.TrimSpace(c.StrategyType) == "" && c.GridConfig != nil {
+		c.StrategyType = "grid_trading"
+	}
+	return nil
 }
 
 // GridStrategyConfig grid trading specific configuration

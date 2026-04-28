@@ -20,6 +20,9 @@ import (
 // validateStrategyConfig validates strategy configuration and returns warnings
 func validateStrategyConfig(config *store.StrategyConfig) []string {
 	var warnings []string
+	if config.StrategyType == "grid_trading" {
+		return warnings
+	}
 
 	// Validate NofxOS API key if any NofxOS feature is enabled
 	if (config.Indicators.EnableQuantData || config.Indicators.EnableOIRanking ||
@@ -29,6 +32,16 @@ func validateStrategyConfig(config *store.StrategyConfig) []string {
 	}
 
 	return warnings
+}
+
+func attachPublishConfig(config *store.StrategyConfig, strategy *store.Strategy) {
+	if config == nil || strategy == nil {
+		return
+	}
+	config.PublishConfig = &store.PublishStrategyConfig{
+		IsPublic:      strategy.IsPublic,
+		ConfigVisible: strategy.ConfigVisible,
+	}
 }
 
 // handleEstimateTokens estimates token usage for a strategy config (no auth required, pure computation)
@@ -71,6 +84,7 @@ func (s *Server) handlePublicStrategies(c *gin.Context) {
 		if st.ConfigVisible {
 			var config store.StrategyConfig
 			json.Unmarshal([]byte(st.Config), &config)
+			attachPublishConfig(&config, st)
 			item["config"] = config
 		}
 
@@ -101,6 +115,7 @@ func (s *Server) handleGetStrategies(c *gin.Context) {
 	for _, st := range strategies {
 		var config store.StrategyConfig
 		json.Unmarshal([]byte(st.Config), &config)
+		attachPublishConfig(&config, st)
 
 		result = append(result, gin.H{
 			"id":             st.ID,
@@ -139,6 +154,7 @@ func (s *Server) handleGetStrategy(c *gin.Context) {
 
 	var config store.StrategyConfig
 	json.Unmarshal([]byte(strategy.Config), &config)
+	attachPublishConfig(&config, strategy)
 
 	c.JSON(http.StatusOK, gin.H{
 		"id":          strategy.ID,
@@ -162,10 +178,12 @@ func (s *Server) handleCreateStrategy(c *gin.Context) {
 	}
 
 	var req struct {
-		Name        string                `json:"name" binding:"required"`
-		Description string                `json:"description"`
-		Lang        string                `json:"lang"`   // "zh" or "en", used when config is omitted
-		Config      *store.StrategyConfig `json:"config"` // optional — uses default if omitted
+		Name          string                `json:"name" binding:"required"`
+		Description   string                `json:"description"`
+		Lang          string                `json:"lang"`   // "zh" or "en", used when config is omitted
+		Config        *store.StrategyConfig `json:"config"` // optional — uses default if omitted
+		IsPublic      bool                  `json:"is_public"`
+		ConfigVisible bool                  `json:"config_visible"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -184,6 +202,17 @@ func (s *Server) handleCreateStrategy(c *gin.Context) {
 	}
 	beforeClamp := *req.Config
 	req.Config.ClampLimits()
+	hadPublishConfig := req.Config.PublishConfig != nil
+	isPublic := req.IsPublic
+	configVisible := req.ConfigVisible
+	if hadPublishConfig {
+		isPublic = req.Config.PublishConfig.IsPublic
+		configVisible = req.Config.PublishConfig.ConfigVisible
+	}
+	req.Config.PublishConfig = &store.PublishStrategyConfig{
+		IsPublic:      isPublic,
+		ConfigVisible: configVisible,
+	}
 
 	// Serialize configuration
 	configJSON, err := json.Marshal(req.Config)
@@ -199,7 +228,10 @@ func (s *Server) handleCreateStrategy(c *gin.Context) {
 		Description: req.Description,
 		IsActive:    false,
 		IsDefault:   false,
-		Config:      string(configJSON),
+		IsPublic:    isPublic,
+		// Existing default is true; keep that behavior when no explicit publish config is sent.
+		ConfigVisible: configVisible || !hadPublishConfig,
+		Config:        string(configJSON),
 	}
 
 	if err := s.store.Strategy().Create(strategy); err != nil {

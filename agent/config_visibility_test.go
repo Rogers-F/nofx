@@ -645,12 +645,6 @@ func TestDescribeStrategyIncludesManualPageSections(t *testing.T) {
 		EnableDirectionAdjust: true,
 		DirectionBiasRatio:    0.7,
 	}
-	cfg.CoinSource.SourceType = "mixed"
-	cfg.CoinSource.StaticCoins = []string{"BTCUSDT", "ETHUSDT"}
-	cfg.CoinSource.ExcludedCoins = []string{"DOGEUSDT"}
-	cfg.Indicators.EnableOIRanking = true
-	cfg.Indicators.EnableNetFlowRanking = true
-	cfg.Indicators.EnablePriceRanking = true
 	rawCfg, err := json.Marshal(cfg)
 	if err != nil {
 		t.Fatalf("marshal strategy config: %v", err)
@@ -682,11 +676,17 @@ func TestDescribeStrategyIncludesManualPageSections(t *testing.T) {
 		"发布设置：已发布到市场；配置隐藏",
 		"网格参数：交易对 BTCUSDT；网格 12；总投资 1500.00；杠杆 4；分布 gaussian",
 		"网格边界：上沿 120000.0000，下沿 90000.0000",
-		"标的来源：mixed | AI500=3 | static=BTCUSDT,ETHUSDT | excluded=DOGEUSDT",
-		"NofxOS 数据：API Key=true，量化数据=true，OI 排行=true，净流入排行=true，价格排行=true",
 	} {
 		if !strings.Contains(detail, expected) {
 			t.Fatalf("expected strategy detail to contain %q, got: %s", expected, detail)
+		}
+	}
+	for _, unexpected := range []string{
+		"标的来源：",
+		"NofxOS 数据：",
+	} {
+		if strings.Contains(detail, unexpected) {
+			t.Fatalf("expected grid strategy detail not to contain AI field %q, got: %s", unexpected, detail)
 		}
 	}
 }

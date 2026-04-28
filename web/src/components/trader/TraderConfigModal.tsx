@@ -12,6 +12,17 @@ function getShortName(fullName: string): string {
   return parts.length > 1 ? parts[parts.length - 1] : fullName
 }
 
+function getStrategyAIConfig(strategy: Strategy) {
+  return strategy.config.ai_config || (
+    strategy.config.coin_source && strategy.config.risk_control
+      ? {
+          coin_source: strategy.config.coin_source,
+          risk_control: strategy.config.risk_control,
+        }
+      : null
+  )
+}
+
 // 交易所注册链接配置
 const EXCHANGE_REGISTRATION_LINKS: Record<string, { url: string; hasReferral?: boolean }> = {
   binance: { url: 'https://www.binance.com/join?ref=NOFXENG', hasReferral: true },
@@ -314,16 +325,27 @@ export function TraderConfigModal({
                   <p className="text-sm text-[#848E9C] mb-2">
                     {selectedStrategy.description || (language === 'zh' ? '无描述' : 'No description')}
                   </p>
-                  <div className="grid grid-cols-2 gap-2 text-xs text-[#848E9C]">
-                    <div>
-                      {t('coinSource', language)}: {selectedStrategy.config.coin_source.source_type === 'static' ? '固定币种' :
-                        selectedStrategy.config.coin_source.source_type === 'ai500' ? 'AI500' :
-                        selectedStrategy.config.coin_source.source_type === 'oi_top' ? 'OI Top' : '混合'}
+                  {selectedStrategy.config.strategy_type === 'grid_trading' && selectedStrategy.config.grid_config ? (
+                    <div className="grid grid-cols-2 gap-2 text-xs text-[#848E9C]">
+                      <div>{language === 'zh' ? '交易对' : 'Symbol'}: {selectedStrategy.config.grid_config.symbol || '-'}</div>
+                      <div>{language === 'zh' ? '网格数' : 'Grids'}: {selectedStrategy.config.grid_config.grid_count}</div>
                     </div>
-                    <div>
-                      {t('marginLimit', language)}: {((selectedStrategy.config.risk_control?.max_margin_usage || 0.9) * 100).toFixed(0)}%
-                    </div>
-                  </div>
+                  ) : (() => {
+                    const aiConfig = getStrategyAIConfig(selectedStrategy)
+                    if (!aiConfig) return null
+                    return (
+                      <div className="grid grid-cols-2 gap-2 text-xs text-[#848E9C]">
+                        <div>
+                          {t('coinSource', language)}: {aiConfig.coin_source.source_type === 'static' ? '固定币种' :
+                            aiConfig.coin_source.source_type === 'ai500' ? 'AI500' :
+                            aiConfig.coin_source.source_type === 'oi_top' ? 'OI Top' : '混合'}
+                        </div>
+                        <div>
+                          {t('marginLimit', language)}: {((aiConfig.risk_control?.max_margin_usage || 0.9) * 100).toFixed(0)}%
+                        </div>
+                      </div>
+                    )
+                  })()}
                 </div>
               )}
             </div>

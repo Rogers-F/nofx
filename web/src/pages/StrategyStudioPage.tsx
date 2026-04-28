@@ -33,6 +33,7 @@ import {
 import type {
   Strategy,
   StrategyConfig,
+  AIStrategyConfig,
   AIModel,
   GridStrategyConfig,
 } from '../types'
@@ -51,6 +52,32 @@ import { DeepVoidBackground } from '../components/common/DeepVoidBackground'
 import { t } from '../i18n/translations'
 
 const API_BASE = import.meta.env.VITE_API_BASE || ''
+
+const getAIConfig = (config: StrategyConfig): AIStrategyConfig | null => {
+  if (config.ai_config) return config.ai_config
+  if (config.coin_source && config.indicators && config.risk_control) {
+    return {
+      coin_source: config.coin_source,
+      indicators: config.indicators,
+      risk_control: config.risk_control,
+      prompt_sections: config.prompt_sections,
+      custom_prompt: config.custom_prompt,
+    }
+  }
+  return null
+}
+
+const normalizeStrategyConfig = (config: StrategyConfig): StrategyConfig => {
+  const aiConfig = getAIConfig(config)
+  const strategyType = config.strategy_type || 'ai_trading'
+  return {
+    strategy_type: strategyType,
+    language: config.language,
+    ai_config: aiConfig || undefined,
+    grid_config: config.grid_config,
+    publish_config: config.publish_config,
+  }
+}
 
 export function StrategyStudioPage() {
   const { token } = useAuth()
@@ -164,7 +191,7 @@ export function StrategyStudioPage() {
       selectedStrategyIDRef.current = nextSelected?.id || ''
 
       if (!hasChangesRef.current || !preservedSelection) {
-        setEditingConfig(nextSelected?.config || null)
+        setEditingConfig(nextSelected?.config ? normalizeStrategyConfig(nextSelected.config) : null)
       }
       if (!nextSelected) {
         setEditingConfig(null)
@@ -234,7 +261,7 @@ export function StrategyStudioPage() {
           { headers: { Authorization: `Bearer ${token}` } }
         )
         if (!response.ok) return
-        const defaultConfig = await response.json()
+        const defaultConfig = normalizeStrategyConfig(await response.json())
 
         // Update only the prompt sections and language field
         setEditingConfig((prev) => {
@@ -242,7 +269,12 @@ export function StrategyStudioPage() {
           return {
             ...prev,
             language: language as 'zh' | 'en',
-            prompt_sections: defaultConfig.prompt_sections,
+            ai_config: prev.ai_config
+              ? {
+                  ...prev.ai_config,
+                  prompt_sections: defaultConfig.ai_config?.prompt_sections,
+                }
+              : prev.ai_config,
           }
         })
         setHasChanges(true)
@@ -263,7 +295,7 @@ export function StrategyStudioPage() {
         { headers: { Authorization: `Bearer ${token}` } }
       )
       if (!configResponse.ok) throw new Error('Failed to fetch default config')
-      const defaultConfig = await configResponse.json()
+      const defaultConfig = normalizeStrategyConfig(await configResponse.json())
 
       const response = await fetch(`${API_BASE}/api/strategies`, {
         method: 'POST',
@@ -479,7 +511,7 @@ export function StrategyStudioPage() {
     try {
       // Always sync the config language with the current interface language
       const configWithLanguage = {
-        ...editingConfig,
+        ...normalizeStrategyConfig(editingConfig),
         language: language as 'zh' | 'en',
       }
       const response = await fetch(
@@ -525,6 +557,23 @@ export function StrategyStudioPage() {
     setHasChanges(true)
   }
 
+  const updateAIConfig = <K extends keyof AIStrategyConfig>(
+    section: K,
+    value: AIStrategyConfig[K]
+  ) => {
+    setEditingConfig((prev) => {
+      if (!prev || !prev.ai_config) return prev
+      return {
+        ...prev,
+        ai_config: {
+          ...prev.ai_config,
+          [section]: value,
+        },
+      }
+    })
+    setHasChanges(true)
+  }
+
   const handleStrategyTypeChange = (
     strategyType: NonNullable<StrategyConfig['strategy_type']>
   ) => {
@@ -547,6 +596,7 @@ export function StrategyStudioPage() {
         return {
           ...prev,
           strategy_type: 'ai_trading',
+          ai_config: getAIConfig(prev) || prev.ai_config,
           // Use null so the field is preserved in JSON and backend merge can actually clear it.
           grid_config: null,
         }
@@ -555,6 +605,7 @@ export function StrategyStudioPage() {
       return {
         ...prev,
         strategy_type: 'grid_trading',
+        ai_config: undefined,
         grid_config: cachedGridConfig ??
           prev.grid_config ?? { ...defaultGridConfig },
       }
@@ -643,6 +694,7 @@ export function StrategyStudioPage() {
 
   // Get current strategy type (default to ai_trading if not set)
   const currentStrategyType = editingConfig?.strategy_type || 'ai_trading'
+  const currentAIConfig = editingConfig ? getAIConfig(editingConfig) : null
 
   const configSections = [
     // Grid Config - only for grid_trading
@@ -668,10 +720,10 @@ export function StrategyStudioPage() {
       color: '#F0B90B',
       title: tr('coinSource'),
       forStrategyType: 'ai_trading' as const,
-      content: editingConfig && (
+      content: currentAIConfig && (
         <CoinSourceEditor
-          config={editingConfig.coin_source}
-          onChange={(coinSource) => updateConfig('coin_source', coinSource)}
+          config={currentAIConfig.coin_source}
+          onChange={(coinSource) => updateAIConfig('coin_source', coinSource)}
           disabled={selectedStrategy?.is_default}
           language={language}
         />
@@ -683,10 +735,10 @@ export function StrategyStudioPage() {
       color: '#0ECB81',
       title: tr('indicators'),
       forStrategyType: 'ai_trading' as const,
-      content: editingConfig && (
+      content: currentAIConfig && (
         <IndicatorEditor
-          config={editingConfig.indicators}
-          onChange={(indicators) => updateConfig('indicators', indicators)}
+          config={currentAIConfig.indicators}
+          onChange={(indicators) => updateAIConfig('indicators', indicators)}
           disabled={selectedStrategy?.is_default}
           language={language}
         />
@@ -698,10 +750,10 @@ export function StrategyStudioPage() {
       color: '#F6465D',
       title: tr('riskControl'),
       forStrategyType: 'ai_trading' as const,
-      content: editingConfig && (
+      content: currentAIConfig && (
         <RiskControlEditor
-          config={editingConfig.risk_control}
-          onChange={(riskControl) => updateConfig('risk_control', riskControl)}
+          config={currentAIConfig.risk_control}
+          onChange={(riskControl) => updateAIConfig('risk_control', riskControl)}
           disabled={selectedStrategy?.is_default}
           language={language}
         />
@@ -713,11 +765,11 @@ export function StrategyStudioPage() {
       color: '#a855f7',
       title: tr('promptSections'),
       forStrategyType: 'ai_trading' as const,
-      content: editingConfig && (
+      content: currentAIConfig && (
         <PromptSectionsEditor
-          config={editingConfig.prompt_sections}
+          config={currentAIConfig.prompt_sections}
           onChange={(promptSections) =>
-            updateConfig('prompt_sections', promptSections)
+            updateAIConfig('prompt_sections', promptSections)
           }
           disabled={selectedStrategy?.is_default}
           language={language}
@@ -730,14 +782,14 @@ export function StrategyStudioPage() {
       color: '#60a5fa',
       title: tr('customPrompt'),
       forStrategyType: 'ai_trading' as const,
-      content: editingConfig && (
+      content: currentAIConfig && (
         <div>
           <p className="text-xs mb-2" style={{ color: '#848E9C' }}>
             {tr('customPromptDesc')}
           </p>
           <textarea
-            value={editingConfig.custom_prompt || ''}
-            onChange={(e) => updateConfig('custom_prompt', e.target.value)}
+            value={currentAIConfig.custom_prompt || ''}
+            onChange={(e) => updateAIConfig('custom_prompt', e.target.value)}
             disabled={selectedStrategy?.is_default}
             placeholder={tr('customPromptPlaceholder')}
             className="w-full h-32 px-3 py-2 rounded-lg resize-none font-mono text-xs"
@@ -848,7 +900,7 @@ export function StrategyStudioPage() {
                   key={strategy.id}
                   onClick={() => {
                     setSelectedStrategy(strategy)
-                    setEditingConfig(strategy.config)
+                    setEditingConfig(normalizeStrategyConfig(strategy.config))
                     setHasChanges(false)
                     setPromptPreview(null)
                     setAiTestResult(null)
