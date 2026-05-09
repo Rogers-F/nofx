@@ -38,6 +38,7 @@ func attachPublishConfig(config *store.StrategyConfig, strategy *store.Strategy)
 	if config == nil || strategy == nil {
 		return
 	}
+	config.ClampLimits()
 	config.PublishConfig = &store.PublishStrategyConfig{
 		IsPublic:      strategy.IsPublic,
 		ConfigVisible: strategy.ConfigVisible,
@@ -460,6 +461,7 @@ func (s *Server) handleGetActiveStrategy(c *gin.Context) {
 
 	var config store.StrategyConfig
 	json.Unmarshal([]byte(strategy.Config), &config)
+	attachPublishConfig(&config, strategy)
 
 	c.JSON(http.StatusOK, gin.H{
 		"id":          strategy.ID,

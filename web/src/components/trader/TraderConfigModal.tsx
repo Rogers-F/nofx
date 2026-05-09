@@ -338,7 +338,8 @@ export function TraderConfigModal({
                         <div>
                           {t('coinSource', language)}: {aiConfig.coin_source.source_type === 'static' ? '固定币种' :
                             aiConfig.coin_source.source_type === 'ai500' ? 'AI500' :
-                            aiConfig.coin_source.source_type === 'oi_top' ? 'OI Top' : '混合'}
+                            aiConfig.coin_source.source_type === 'oi_top' ? 'OI Top' :
+                            aiConfig.coin_source.source_type === 'oi_low' ? 'OI Low' : '-'}
                         </div>
                         <div>
                           {t('marginLimit', language)}: {((aiConfig.risk_control?.max_margin_usage || 0.9) * 100).toFixed(0)}%

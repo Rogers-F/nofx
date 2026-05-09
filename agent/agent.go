@@ -513,8 +513,12 @@ const (
 
 // buildSystemPrompt creates the system prompt that makes NOFXi behave like a real agent.
 func (a *Agent) buildSystemPrompt(lang string) string {
+	return a.buildSystemPromptForStoreUser(lang, "default")
+}
+
+func (a *Agent) buildSystemPromptForStoreUser(lang, storeUserID string) string {
 	// Gather live system state
-	traderInfo := a.getTradersSummary()
+	traderInfo := a.getTradersSummaryForStoreUser(storeUserID)
 	watchlist := ""
 	if a.sentinel != nil {
 		watchlist = a.sentinel.FormatWatchlist(lang)
@@ -700,7 +704,7 @@ Current time: %s`, traderInfo, watchlist, skillCatalog, time.Now().Format("2006-
 }
 
 // gatherContext collects real-time market data relevant to the user's message.
-func (a *Agent) gatherContext(text string) string {
+func (a *Agent) gatherContext(storeUserID, text string) string {
 	var parts []string
 	upper := strings.ToUpper(text)
 
@@ -765,8 +769,16 @@ func (a *Agent) gatherContext(text string) string {
 	}
 
 	// Trader positions
-	if a.traderManager != nil {
-		for _, t := range a.traderManager.GetAllTraders() {
+	if a.traderManager != nil && a.store != nil {
+		traderConfigs, _ := a.store.Trader().List(storeUserID)
+		for _, traderCfg := range traderConfigs {
+			if strings.TrimSpace(traderCfg.ID) == "" {
+				continue
+			}
+			t, err := a.traderManager.GetTrader(traderCfg.ID)
+			if err != nil {
+				continue
+			}
 			positions, err := t.GetPositions()
 			if err != nil {
 				continue
@@ -786,27 +798,51 @@ func (a *Agent) gatherContext(text string) string {
 }
 
 func (a *Agent) getTradersSummary() string {
+	return a.getTradersSummaryForStoreUser("default")
+}
+
+func (a *Agent) getTradersSummaryForStoreUser(storeUserID string) string {
 	if a.traderManager == nil {
 		return "Traders: none configured"
 	}
-	traders := a.traderManager.GetAllTraders()
-	if len(traders) == 0 {
+	if a.store == nil {
+		return "Traders: none configured"
+	}
+	if strings.TrimSpace(storeUserID) == "" {
+		storeUserID = "default"
+	}
+	traderConfigs, err := a.store.Trader().List(storeUserID)
+	if err != nil || len(traderConfigs) == 0 {
 		return "Traders: none configured"
 	}
 
 	var lines []string
-	for id, t := range traders {
-		s := t.GetStatus()
-		running, _ := s["is_running"].(bool)
+	for _, traderCfg := range traderConfigs {
+		if strings.TrimSpace(traderCfg.ID) == "" {
+			continue
+		}
+		t, err := a.traderManager.GetTrader(traderCfg.ID)
+		isRunning := traderCfg.IsRunning
+		exchange := traderCfg.ExchangeID
+		if err == nil && t != nil {
+			s := t.GetStatus()
+			if running, ok := s["is_running"].(bool); ok {
+				isRunning = running
+			}
+			exchange = t.GetExchange()
+		}
 		status := "stopped"
-		if running {
+		if isRunning {
 			status = "running"
 		}
-		tid := id
+		tid := traderCfg.ID
 		if len(tid) > 8 {
 			tid = tid[:8]
 		}
-		lines = append(lines, fmt.Sprintf("• %s [%s] %s | %s", t.GetName(), tid, status, t.GetExchange()))
+		lines = append(lines, fmt.Sprintf("• %s [%s] %s | %s", traderCfg.Name, tid, status, exchange))
+	}
+	if len(lines) == 0 {
+		return "Traders: none configured"
 	}
 	return "Traders:\n" + strings.Join(lines, "\n")
 }
@@ -834,7 +870,7 @@ func (a *Agent) handleStatus(L string) string {
 }
 
 // noAIFallback — when no AI is available, still try to be useful.
-func (a *Agent) noAIFallback(lang, text string) (string, error) {
+func (a *Agent) noAIFallback(storeUserID, lang, text string) (string, error) {
 	upper := strings.ToUpper(text)
 
 	// Try to provide market data directly
@@ -849,10 +885,10 @@ func (a *Agent) noAIFallback(lang, text string) (string, error) {
 
 	// Check if asking about positions/balance
 	if strings.Contains(text, "持仓") || strings.Contains(upper, "POSITION") {
-		return a.queryPositionsDirect(lang)
+		return a.queryPositionsDirect(storeUserID, lang)
 	}
 	if strings.Contains(text, "余额") || strings.Contains(upper, "BALANCE") {
-		return a.queryBalancesDirect(lang)
+		return a.queryBalancesDirect(storeUserID, lang)
 	}
 
 	if lang == "zh" {
@@ -884,10 +920,24 @@ func aiServiceFailureGuidance(lang, reason string) string {
 	looksLikeRateLimit := strings.Contains(lower, "status 429") ||
 		strings.Contains(lower, "rate limit") ||
 		strings.Contains(lower, "rate_limit_error")
+	looksLikeBannedAccount := strings.Contains(lower, "user_is_banned") ||
+		strings.Contains(lower, "account is banned") ||
+		strings.Contains(lower, "account banned")
+	looksLikeAuthFailure := strings.Contains(lower, "status 401") ||
+		strings.Contains(lower, "authentication_failed") ||
+		strings.Contains(lower, "authentication_error") ||
+		strings.Contains(lower, "unauthorized") ||
+		strings.Contains(lower, "invalid api key")
 
 	if lang == "zh" {
 		if looksLikeHTMLGateway {
 			return "这不是“未配置模型”。这次更像是上游返回了 HTML 页面或网关/反代错误页，而不是标准 JSON 响应。更可能原因是模型服务地址配错、网关拦截、支付/鉴权页返回、或上游服务临时异常。请优先检查当前启用模型的 custom_api_url、反向代理/网关状态，以及对应 provider 的服务状态。"
+		}
+		if looksLikeBannedAccount {
+			return "这不是“未配置模型”。当前启用模型已经连到了上游，但上游明确拒绝登录，原因是账号被禁用/封禁（USER_IS_BANNED）。请检查当前启用模型配置对应的账号或 API Key，换一个可用账号/API Key，或切换到另一个已启用模型后再试。"
+		}
+		if looksLikeAuthFailure {
+			return "这不是“未配置模型”。当前启用模型已经连到了上游，但鉴权失败了。请检查当前启用模型的 API Key、钱包凭证、provider 账号状态和 custom_api_url 是否匹配；修复凭证或切换到另一个可用模型后再试。"
 		}
 		if looksLikeUpstreamEmptyOutput {
 			return "这不是“未配置模型”。这次更像是上游模型没有返回有效内容，当前 provider 把它包装成了 429 / rate_limit_error。更可能原因是上游临时限流、服务拥塞、模型空响应，或 provider 网关没有拿到有效结果；不应优先归因成“余额不足”。请先重试一次；如果持续出现，再检查当前启用模型的 provider 状态、限流配额、网关日志，或先切换到另一个可用模型。"
@@ -900,6 +950,12 @@ func aiServiceFailureGuidance(lang, reason string) string {
 	if looksLikeHTMLGateway {
 		return "This is not a missing-model issue. It looks more like the upstream returned an HTML page or gateway/proxy error page instead of the expected JSON response. The likely causes are a wrong model endpoint URL, gateway interception, a payment/auth page being returned, or a temporary upstream outage. Check the active model's custom_api_url, proxy/gateway status, and the provider service health first."
 	}
+	if looksLikeBannedAccount {
+		return "This is not a missing-model issue. The active model reached the upstream provider, but login was rejected because the account is banned (USER_IS_BANNED). Check the active model account/API key, replace it with a usable credential, or switch to another enabled model."
+	}
+	if looksLikeAuthFailure {
+		return "This is not a missing-model issue. The active model reached the upstream provider, but authentication failed. Check the active model API key, wallet credential, provider account status, and custom_api_url, or switch to another enabled model."
+	}
 	if looksLikeUpstreamEmptyOutput {
 		return "This is not a missing-model issue. The upstream model appears to have returned no usable output, and the provider wrapped it as a 429 / rate_limit_error. The more likely causes are temporary throttling, upstream congestion, an empty model response, or a gateway that did not receive a valid result. Do not treat this as an insufficient-balance issue first. Retry once, then check the active provider status, rate limits, gateway logs, or switch to another model."
 	}
@@ -909,14 +965,28 @@ func aiServiceFailureGuidance(lang, reason string) string {
 	return "This is not a missing-model issue. The active model provider more likely returned an API error, authentication failure, timeout, or insufficient-balance response. Please check the active model API and try again."
 }
 
-func (a *Agent) queryPositionsDirect(L string) (string, error) {
+func (a *Agent) queryPositionsDirect(storeUserID, L string) (string, error) {
 	if a.traderManager == nil {
+		return a.msg(L, "no_traders"), nil
+	}
+	if a.store == nil {
+		return a.msg(L, "no_traders"), nil
+	}
+	traderConfigs, err := a.store.Trader().List(storeUserID)
+	if err != nil {
 		return a.msg(L, "no_traders"), nil
 	}
 	var sb strings.Builder
 	sb.WriteString("📊 *Positions*\n\n")
 	hasAny := false
-	for id, t := range a.traderManager.GetAllTraders() {
+	for _, traderCfg := range traderConfigs {
+		if strings.TrimSpace(traderCfg.ID) == "" {
+			continue
+		}
+		t, err := a.traderManager.GetTrader(traderCfg.ID)
+		if err != nil {
+			continue
+		}
 		positions, err := t.GetPositions()
 		if err != nil {
 			continue
@@ -932,7 +1002,11 @@ func (a *Agent) queryPositionsDirect(L string) (string, error) {
 			if pnl < 0 {
 				e = "🔴"
 			}
-			sb.WriteString(fmt.Sprintf("%s *%s* %s — $%.2f | Trader: %s\n", e, p["symbol"], p["side"], pnl, id[:8]))
+			tid := traderCfg.ID
+			if len(tid) > 8 {
+				tid = tid[:8]
+			}
+			sb.WriteString(fmt.Sprintf("%s *%s* %s — $%.2f | Trader: %s\n", e, p["symbol"], p["side"], pnl, tid))
 		}
 	}
 	if !hasAny {
@@ -941,18 +1015,32 @@ func (a *Agent) queryPositionsDirect(L string) (string, error) {
 	return sb.String(), nil
 }
 
-func (a *Agent) queryBalancesDirect(L string) (string, error) {
+func (a *Agent) queryBalancesDirect(storeUserID, L string) (string, error) {
 	if a.traderManager == nil {
+		return a.msg(L, "no_traders"), nil
+	}
+	if a.store == nil {
+		return a.msg(L, "no_traders"), nil
+	}
+	traderConfigs, err := a.store.Trader().List(storeUserID)
+	if err != nil {
 		return a.msg(L, "no_traders"), nil
 	}
 	var sb strings.Builder
 	sb.WriteString("💰 *Balance*\n\n")
-	for id, t := range a.traderManager.GetAllTraders() {
+	for _, traderCfg := range traderConfigs {
+		if strings.TrimSpace(traderCfg.ID) == "" {
+			continue
+		}
+		t, err := a.traderManager.GetTrader(traderCfg.ID)
+		if err != nil {
+			continue
+		}
 		info, err := t.GetAccountInfo()
 		if err != nil {
 			continue
 		}
-		tid := id
+		tid := traderCfg.ID
 		if len(tid) > 8 {
 			tid = tid[:8]
 		}

@@ -171,7 +171,7 @@ func TestExecuteUnifiedTurnDecisionContinueActiveDoesNotHandOffToPlanner(t *test
 	if !handled {
 		t.Fatal("expected active session continuation to be handled")
 	}
-	if !strings.Contains(answer, "配置整理好了") || !strings.Contains(answer, "BTCUSDT") || strings.Contains(answer, "交易机器人") || strings.Contains(answer, "AI模型和交易所") {
+	if !strings.Contains(answer, "还缺") || !strings.Contains(answer, "交易对") || strings.Contains(answer, "交易机器人") || strings.Contains(answer, "AI模型和交易所") {
 		t.Fatalf("expected strategy session to continue without planner/trader handoff, got: %s", answer)
 	}
 	if _, ok := a.getActiveSkillSession(userID); !ok {
@@ -217,6 +217,16 @@ func TestGuardUnsupportedAsyncPromiseBlocksFakeDiagnosisProgress(t *testing.T) {
 	_, blocked = guardUnsupportedAsyncPromise("zh", "好的，参数已确认，正在为您创建“餐巾纸”网格策略。")
 	if !blocked {
 		t.Fatal("expected fake async strategy create progress to be blocked")
+	}
+}
+
+func TestFinishTaskGuardBlocksFakeCreateProgressPromise(t *testing.T) {
+	reply, blocked := guardUnsupportedAsyncPromise("zh", "策略正在创建中，请稍等一会儿。创建成功后我会立刻告诉您。")
+	if !blocked {
+		t.Fatal("expected fake create progress promise to be blocked")
+	}
+	if !strings.Contains(reply, "没有后台异步任务") || !strings.Contains(reply, "实际执行") {
+		t.Fatalf("expected honest execution correction, got: %s", reply)
 	}
 }
 

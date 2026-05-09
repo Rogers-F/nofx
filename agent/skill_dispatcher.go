@@ -397,42 +397,6 @@ func (a *Agent) tryHardSkill(ctx context.Context, storeUserID string, userID int
 			return answer, true
 		}
 	}
-	if hasExplicitDiagnosisIntentForDomain(text, "model") {
-		answer := a.handleModelDiagnosisSkill(storeUserID, lang, text)
-		a.recordSkillInteraction(userID, text, answer)
-		if onEvent != nil {
-			onEvent(StreamEventTool, "hard_skill:model_diagnosis")
-			emitStreamText(onEvent, answer)
-		}
-		return answer, true
-	}
-	if hasExplicitDiagnosisIntentForDomain(text, "exchange") {
-		answer := a.handleExchangeDiagnosisSkill(storeUserID, lang, text)
-		a.recordSkillInteraction(userID, text, answer)
-		if onEvent != nil {
-			onEvent(StreamEventTool, "hard_skill:exchange_diagnosis")
-			emitStreamText(onEvent, answer)
-		}
-		return answer, true
-	}
-	if hasExplicitDiagnosisIntentForDomain(text, "trader") {
-		answer := a.handleTraderDiagnosisSkill(storeUserID, lang, text)
-		a.recordSkillInteraction(userID, text, answer)
-		if onEvent != nil {
-			onEvent(StreamEventTool, "hard_skill:trader_diagnosis")
-			emitStreamText(onEvent, answer)
-		}
-		return answer, true
-	}
-	if hasExplicitDiagnosisIntentForDomain(text, "strategy") {
-		answer := a.handleStrategyDiagnosisSkill(storeUserID, lang, text)
-		a.recordSkillInteraction(userID, text, answer)
-		if onEvent != nil {
-			onEvent(StreamEventTool, "hard_skill:strategy_diagnosis")
-			emitStreamText(onEvent, answer)
-		}
-		return answer, true
-	}
 	return "", false
 }
 

@@ -76,3 +76,49 @@ func TestStrategyConfigUnmarshalLegacyFlatAIConfig(t *testing.T) {
 		t.Fatalf("did not expect legacy coin_source at top level: %s", string(normalized))
 	}
 }
+
+func TestStrategyConfigNormalizeProductSchemaForLLMLabels(t *testing.T) {
+	cfg := GetDefaultStrategyConfig("zh")
+	patch := map[string]any{
+		"strategy_type": "AI 策略",
+		"ai_config": map[string]any{
+			"coin_source": map[string]any{
+				"source_type": "AI500",
+			},
+			"indicators": map[string]any{
+				"klines": map[string]any{
+					"primary_timeframe":   "1分钟",
+					"selected_timeframes": []any{`["1m"`, `"5m"`, `"15m"]`},
+				},
+			},
+		},
+	}
+
+	merged, err := MergeStrategyConfig(cfg, patch)
+	if err != nil {
+		t.Fatalf("merge strategy config: %v", err)
+	}
+	merged.ClampLimits()
+
+	if merged.StrategyType != "ai_trading" {
+		t.Fatalf("strategy_type = %q, want ai_trading", merged.StrategyType)
+	}
+	if merged.CoinSource.SourceType != "ai500" {
+		t.Fatalf("source_type = %q, want ai500", merged.CoinSource.SourceType)
+	}
+	if !merged.CoinSource.UseAI500 || merged.CoinSource.UseOITop || merged.CoinSource.UseOILow {
+		t.Fatalf("coin source flags not normalized: %+v", merged.CoinSource)
+	}
+	if merged.Indicators.Klines.PrimaryTimeframe != "1m" {
+		t.Fatalf("primary_timeframe = %q, want 1m", merged.Indicators.Klines.PrimaryTimeframe)
+	}
+	want := []string{"1m", "5m", "15m"}
+	if len(merged.Indicators.Klines.SelectedTimeframes) != len(want) {
+		t.Fatalf("selected_timeframes = %+v, want %+v", merged.Indicators.Klines.SelectedTimeframes, want)
+	}
+	for i := range want {
+		if merged.Indicators.Klines.SelectedTimeframes[i] != want[i] {
+			t.Fatalf("selected_timeframes = %+v, want %+v", merged.Indicators.Klines.SelectedTimeframes, want)
+		}
+	}
+}

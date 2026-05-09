@@ -1,12 +1,14 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
 
+	"nofx/mcp"
 	"nofx/store"
 )
 
@@ -505,10 +507,6 @@ func buildExchangeUpdatePatchFromSession(session skillSession) exchangeUpdatePat
 	return patch
 }
 
-func detectStrategyConfigField(text string) string {
-	return ""
-}
-
 func strategyConfigFieldDisplayName(field, lang string) string {
 	switch field {
 	case "name":
@@ -828,19 +826,6 @@ func strategyConfigFieldDisplayName(field, lang string) string {
 	}
 }
 
-func extractStrategyConfigValue(text, field string) (string, bool) {
-	return "", false
-}
-
-type strategyConfigPatch struct {
-	Field string
-	Value string
-}
-
-func detectStrategyConfigPatches(text string) []strategyConfigPatch {
-	return nil
-}
-
 func applyStrategyConfigPatch(cfg *store.StrategyConfig, field, value string) error {
 	ensureGridConfig := func() *store.GridStrategyConfig {
 		if cfg.GridConfig == nil {
@@ -925,11 +910,7 @@ func applyStrategyConfigPatch(cfg *store.StrategyConfig, field, value string) er
 	case "description", "is_public", "config_visible":
 		return nil
 	case "max_positions":
-		parsed, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("最大持仓需要是整数")
-		}
-		cfg.RiskControl.MaxPositions = parsed
+		return fmt.Errorf("%s", strategyLockedFieldError("zh", field))
 	case "source_type":
 		cfg.CoinSource.SourceType = value
 	case "static_coins":
@@ -992,29 +973,13 @@ func applyStrategyConfigPatch(cfg *store.StrategyConfig, field, value string) er
 		}
 		cfg.RiskControl.AltcoinMaxLeverage = parsed
 	case "btceth_max_position_value_ratio":
-		parsed, err := strconv.ParseFloat(value, 64)
-		if err != nil {
-			return fmt.Errorf("BTC/ETH 仓位价值倍数需要是数字")
-		}
-		cfg.RiskControl.BTCETHMaxPositionValueRatio = parsed
+		return fmt.Errorf("%s", strategyLockedFieldError("zh", field))
 	case "altcoin_max_position_value_ratio":
-		parsed, err := strconv.ParseFloat(value, 64)
-		if err != nil {
-			return fmt.Errorf("山寨币仓位价值倍数需要是数字")
-		}
-		cfg.RiskControl.AltcoinMaxPositionValueRatio = parsed
+		return fmt.Errorf("%s", strategyLockedFieldError("zh", field))
 	case "max_margin_usage":
-		parsed, err := strconv.ParseFloat(value, 64)
-		if err != nil {
-			return fmt.Errorf("最大保证金使用率需要是数字")
-		}
-		cfg.RiskControl.MaxMarginUsage = parsed
+		return fmt.Errorf("%s", strategyLockedFieldError("zh", field))
 	case "min_position_size":
-		parsed, err := strconv.ParseFloat(value, 64)
-		if err != nil {
-			return fmt.Errorf("最小开仓金额需要是数字")
-		}
-		cfg.RiskControl.MinPositionSize = parsed
+		return fmt.Errorf("%s", strategyLockedFieldError("zh", field))
 	case "primary_timeframe":
 		cfg.Indicators.Klines.PrimaryTimeframe = value
 	case "primary_count":
@@ -1214,9 +1179,15 @@ func extractDurationValue(text string) string {
 func parseStrategyTypeValue(text string) string {
 	lower := strings.ToLower(strings.TrimSpace(text))
 	switch {
+	case lower == "grid_trading":
+		return "grid_trading"
+	case lower == "ai_trading":
+		return "ai_trading"
 	case containsAny(lower, []string{"grid", "网格"}):
 		return "grid_trading"
-	case containsAny(lower, []string{"ai trading", "ai策略", "普通策略"}):
+	case containsAny(lower, []string{"ai500", "oi top", "oi low", "静态币", "固定币", "选币来源"}):
+		return "ai_trading"
+	case containsAny(lower, []string{"ai trading", "ai策略", "ai 策略", "ai交易", "ai 交易", "ai智能", "智能策略", "普通策略"}):
 		return "ai_trading"
 	default:
 		return ""
@@ -2417,10 +2388,7 @@ func (a *Agent) executeStrategyManagementAction(storeUserID string, userID int64
 		if session.Action == "update_prompt" {
 			return a.executeStrategyPromptUpdate(storeUserID, userID, lang, text, session)
 		}
-		if session.Action == "update_config" ||
-			fieldValue(session, strategyPendingUpdateConfigField) != "" ||
-			fieldValue(session, "config_field") != "" ||
-			fieldValue(session, "config_value") != "" {
+		if session.Action == "update_config" || fieldValue(session, strategyPendingUpdateConfigField) != "" {
 			return a.executeStrategyConfigUpdate(storeUserID, userID, lang, text, session)
 		}
 		if fieldValue(session, skillDAGStepField) == "" {
@@ -2550,11 +2518,10 @@ func (a *Agent) executeStrategyConfigUpdate(storeUserID string, userID int64, la
 
 	if _, ok := getSkillDAG("strategy_management", "update_config"); ok {
 		if fieldValue(session, skillDAGStepField) == "" {
-			setSkillDAGStep(&session, "resolve_config_field")
+			setSkillDAGStep(&session, "collect_config_patch")
 		}
 	}
 
-	currentStep, _ := currentSkillDAGStep(session)
 	strategy, cfg, err := a.loadStrategyConfigForUpdate(storeUserID, session.TargetRef.ID)
 	if err != nil {
 		if lang == "zh" {
@@ -2566,7 +2533,7 @@ func (a *Agent) executeStrategyConfigUpdate(storeUserID string, userID int64, la
 	if patchRaw := strings.TrimSpace(fieldValue(session, strategyCreateConfigPatchField)); patchRaw != "" {
 		var patch map[string]any
 		if err := json.Unmarshal([]byte(patchRaw), &patch); err != nil {
-			setSkillDAGStep(&session, "resolve_config_field")
+			setSkillDAGStep(&session, "collect_config_patch")
 			a.saveSkillSession(userID, session)
 			if lang == "zh" {
 				return "策略配置 patch 不是合法 JSON：" + err.Error()
@@ -2575,7 +2542,7 @@ func (a *Agent) executeStrategyConfigUpdate(storeUserID string, userID int64, la
 		}
 		merged, err := store.MergeStrategyConfig(cfg, patch)
 		if err != nil {
-			setSkillDAGStep(&session, "resolve_config_field")
+			setSkillDAGStep(&session, "collect_config_patch")
 			a.saveSkillSession(userID, session)
 			if lang == "zh" {
 				return "策略配置 patch 无法应用：" + err.Error()
@@ -2586,7 +2553,7 @@ func (a *Agent) executeStrategyConfigUpdate(storeUserID string, userID int64, la
 		merged.ClampLimits()
 		msgZH := "已更新策略配置。"
 		msgEN := "Updated strategy config."
-		setSkillDAGStep(&session, "apply_field_update")
+		setSkillDAGStep(&session, "execute_update")
 		if warnings := store.StrategyClampWarnings(beforeClamp, merged, lang); len(warnings) > 0 {
 			return a.deferStrategyRiskControlledUpdate(userID, lang, &session, merged, warnings, msgZH, msgEN)
 		}
@@ -2612,146 +2579,12 @@ func (a *Agent) executeStrategyConfigUpdate(storeUserID string, userID int64, la
 		return msgEN
 	}
 
-	if generatedDraftRequiresConfirmation(session) && fieldValue(session, "config_field") == "" && fieldValue(session, "config_value") == "" {
-		if generated := fieldValue(session, "custom_prompt"); generated != "" {
-			setField(&session, "config_field", "custom_prompt")
-			setField(&session, "config_value", generated)
-		}
+	setSkillDAGStep(&session, "collect_config_patch")
+	a.saveSkillSession(userID, session)
+	if lang == "zh" {
+		return "你可以直接说想怎么改策略配置，比如“选币来源改成 AI500，最低置信度 80”。我会按当前策略类型的产品模板生成 config_patch 后再更新。"
 	}
-	if generatedDraftRequiresConfirmation(session) {
-		switch {
-		case createConfirmationReply(text):
-			clearGeneratedDraftConfirmation(&session)
-		case isNoReply(text):
-			clearGeneratedDraftConfirmation(&session, "config_field", "config_value", "custom_prompt")
-			setSkillDAGStep(&session, "resolve_config_field")
-			session.Phase = "collecting"
-			a.saveSkillSession(userID, session)
-			if lang == "zh" {
-				return "好，我先不用这版草稿。你可以直接告诉我要改哪个配置，或者继续让我重新设计一版。"
-			}
-			return "Okay, I won't use that draft. Tell me which config to change, or ask me to draft another version."
-		}
-	}
-
-	if fieldValue(session, "config_field") == "" && fieldValue(session, "config_value") == "" {
-		if strings.Contains(strings.ToLower(text), "min position size") || strings.Contains(strings.ToLower(text), "最小开仓金额") {
-			a.clearSkillSession(userID)
-			return strategyLockedFieldError(lang, "min_position_size")
-		}
-		patches := detectStrategyConfigPatches(text)
-		if len(patches) > 1 {
-			changed := make([]string, 0, len(patches))
-			for _, patch := range patches {
-				if patch.Field == "min_position_size" {
-					a.clearSkillSession(userID)
-					return strategyLockedFieldError(lang, "min_position_size")
-				}
-				if err := applyStrategyConfigPatch(&cfg, patch.Field, patch.Value); err != nil {
-					a.saveSkillSession(userID, session)
-					if lang == "zh" {
-						return "这次没改成功：" + err.Error()
-					}
-					return "That change did not go through: " + err.Error()
-				}
-				switch patch.Field {
-				case "description":
-					strategy.Description = patch.Value
-				case "is_public":
-					strategy.IsPublic = patch.Value == "true"
-				case "config_visible":
-					strategy.ConfigVisible = patch.Value == "true"
-				}
-				changed = append(changed, strategyConfigFieldDisplayName(patch.Field, lang))
-			}
-			beforeClamp := cfg
-			cfg.ClampLimits()
-			setSkillDAGStep(&session, "apply_field_update")
-			msgZH := "已更新策略参数：" + strings.Join(changed, "、") + "。"
-			msgEN := "Updated strategy config fields: " + strings.Join(changed, ", ") + "."
-			if warnings := store.StrategyClampWarnings(beforeClamp, cfg, lang); len(warnings) > 0 {
-				return a.deferStrategyRiskControlledUpdate(userID, lang, &session, cfg, warnings, msgZH, msgEN)
-			}
-			setSkillDAGStep(&session, "execute_update")
-			return a.persistStrategyConfigUpdate(storeUserID, userID, lang, strategy, cfg, msgZH, msgEN)
-		}
-	}
-
-	field := fieldValue(session, "config_field")
-	if field == "" {
-		field = detectStrategyConfigField(text)
-		if field != "" {
-			if field == "min_position_size" {
-				a.clearSkillSession(userID)
-				return strategyLockedFieldError(lang, field)
-			}
-			setField(&session, "config_field", field)
-			if currentStep.ID == "resolve_config_field" {
-				advanceSkillDAGStep(&session, currentStep.ID)
-				currentStep, _ = currentSkillDAGStep(session)
-			}
-		}
-	}
-	if field == "" {
-		setSkillDAGStep(&session, "resolve_config_field")
-		a.saveSkillSession(userID, session)
-		if lang == "zh" {
-			return "你可以直接告诉我想改哪一项，比如币种来源、杠杆、时间周期、技术指标，或者提示词。"
-		}
-		return "Tell me what you want to change, for example coin source, leverage, timeframes, indicators, or the prompt."
-	}
-
-	if fieldValue(session, "config_value") == "" {
-		if value, ok := extractStrategyConfigValue(text, field); ok {
-			setField(&session, "config_value", value)
-			if currentStep.ID == "resolve_config_value" {
-				advanceSkillDAGStep(&session, currentStep.ID)
-				currentStep, _ = currentSkillDAGStep(session)
-			}
-		}
-	}
-	value := fieldValue(session, "config_value")
-	if value == "" {
-		setSkillDAGStep(&session, "resolve_config_value")
-		a.saveSkillSession(userID, session)
-		if lang == "zh" {
-			return fmt.Sprintf("还差一步：请告诉我新的%s。", strategyConfigFieldDisplayName(field, lang))
-		}
-		return fmt.Sprintf("One more thing: tell me the new %s.", strategyConfigFieldDisplayName(field, lang))
-	}
-
-	if err := applyStrategyConfigPatch(&cfg, field, value); err != nil {
-		setSkillDAGStep(&session, "resolve_config_value")
-		a.saveSkillSession(userID, session)
-		if lang == "zh" {
-			return err.Error()
-		}
-		return err.Error()
-	}
-	switch field {
-	case "description":
-		strategy.Description = value
-	case "is_public":
-		strategy.IsPublic = value == "true"
-	case "config_visible":
-		strategy.ConfigVisible = value == "true"
-	}
-
-	beforeClamp := cfg
-	cfg.ClampLimits()
-	changed := []string{field}
-	displayChanged := make([]string, 0, len(changed))
-	for _, item := range changed {
-		displayChanged = append(displayChanged, strategyConfigFieldDisplayName(item, lang))
-	}
-	msgZH := "已更新策略参数：" + strings.Join(displayChanged, "、") + "。"
-	msgEN := "Updated strategy config fields: " + strings.Join(displayChanged, ", ") + "."
-	setSkillDAGStep(&session, "apply_field_update")
-	if warnings := store.StrategyClampWarnings(beforeClamp, cfg, lang); len(warnings) > 0 {
-		return a.deferStrategyRiskControlledUpdate(userID, lang, &session, cfg, warnings, msgZH, msgEN)
-	}
-	setSkillDAGStep(&session, "execute_update")
-	return a.persistStrategyConfigUpdate(storeUserID, userID, lang, strategy, cfg, msgZH, msgEN)
+	return "Tell me how you want to change the strategy config, for example: set coin source to ai500 and minimum confidence to 80. I will turn it into a config_patch for the current strategy type before updating."
 }
 
 func (a *Agent) loadStrategyConfigForUpdate(storeUserID, strategyID string) (*store.Strategy, store.StrategyConfig, error) {
@@ -2913,20 +2746,396 @@ func extractTimeframes(text string) []string {
 }
 
 func (a *Agent) handleTraderDiagnosisSkill(storeUserID, lang, text string) string {
-	raw := a.toolListTraders(storeUserID)
-	list := formatReadFastPathResponse(lang, "list_traders", raw)
-	if lang == "zh" {
-		reply := "现象：这是交易员运行诊断问题。\n优先排查：\n1. 交易员是否已创建并处于运行状态。\n2. 绑定的模型、交易所、策略是否齐全。\n3. 是“没有启动”、还是“启动了但 AI 没有下单”、还是“下单失败”。\n当前交易员概览：\n" + list
-		if excerpt := backendLogDiagnosisExcerpt(lang, text, "trader"); excerpt != "" {
-			reply += "\n" + excerpt
+	target := resolveDiagnosisTraderTarget(a.loadTraderOptions(storeUserID), text)
+	if target == nil {
+		raw := a.toolListTraders(storeUserID)
+		list := formatReadFastPathResponse(lang, "list_traders", raw)
+		if lang == "zh" {
+			return "我需要先确定要诊断哪个交易员。当前交易员：\n" + list
 		}
-		return reply
+		return "I need to know which trader to diagnose first. Current traders:\n" + list
 	}
-	reply := "This looks like a trader diagnosis issue.\nCheck whether the trader exists, is running, and has model/exchange/strategy bindings.\nCurrent trader overview:\n" + list
-	if excerpt := backendLogDiagnosisExcerpt(lang, text, "trader"); excerpt != "" {
-		reply += "\n" + excerpt
+
+	evidence := a.collectTraderDiagnosisEvidence(storeUserID, target.ID, target.Name)
+	if answer, ok := a.generateTraderDiagnosisAnswerWithLLM(context.Background(), lang, text, evidence); ok {
+		return answer
 	}
-	return reply
+	return formatTraderDiagnosisEvidence(lang, evidence)
+}
+
+func resolveDiagnosisTraderTarget(options []traderSkillOption, text string) *traderSkillOption {
+	if opt := findOptionByIDOrName(options, text); opt != nil {
+		return opt
+	}
+	if opt := findUniqueContainingOption(options, text); opt != nil {
+		return opt
+	}
+	if len(options) == 1 {
+		return &options[0]
+	}
+	return nil
+}
+
+type traderDecisionToolResponse struct {
+	Error      string `json:"error"`
+	TraderID   string `json:"trader_id"`
+	TraderName string `json:"trader_name"`
+	Count      int    `json:"count"`
+	Records    []struct {
+		Success             bool             `json:"success"`
+		ErrorMessage        string           `json:"error_message"`
+		AIRequestDurationMs int              `json:"ai_request_duration_ms"`
+		CandidateCoins      []string         `json:"candidate_coins"`
+		ExecutionLog        []string         `json:"execution_log"`
+		DecisionJSON        string           `json:"decision_json"`
+		Decisions           []map[string]any `json:"decisions"`
+	} `json:"records"`
+}
+
+type traderDiagnosisEvidence struct {
+	TraderName   string
+	TraderConfig *store.Trader
+	Model        *safeModelToolConfig
+	Exchange     *safeExchangeToolConfig
+	Strategy     *safeStrategyToolConfig
+	Runtime      map[string]any
+	Account      map[string]any
+	Positions    []map[string]any
+	Decisions    traderDecisionToolResponse
+	Logs         struct {
+		Entries []any  `json:"entries"`
+		Count   int    `json:"count"`
+		Error   string `json:"error"`
+	}
+}
+
+func (a *Agent) collectTraderDiagnosisEvidence(storeUserID, traderID, traderName string) traderDiagnosisEvidence {
+	ev := traderDiagnosisEvidence{TraderName: traderName}
+	if a.store != nil {
+		if traderCfg, err := a.resolveTraderForTool(storeUserID, traderID, traderName); err == nil {
+			ev.TraderConfig = traderCfg
+			ev.TraderName = defaultIfEmpty(traderCfg.Name, ev.TraderName)
+			if model, err := a.store.AIModel().Get(storeUserID, traderCfg.AIModelID); err == nil && model != nil {
+				safeModel := safeModelForTool(model)
+				ev.Model = &safeModel
+			}
+			if exchange, err := a.store.Exchange().GetByID(storeUserID, traderCfg.ExchangeID); err == nil && exchange != nil {
+				safeExchange := safeExchangeForTool(exchange)
+				ev.Exchange = &safeExchange
+			}
+			if strings.TrimSpace(traderCfg.StrategyID) != "" {
+				if strategy, err := a.store.Strategy().Get(storeUserID, traderCfg.StrategyID); err == nil && strategy != nil {
+					safeStrategy := safeStrategyForTool(strategy)
+					ev.Strategy = &safeStrategy
+				}
+			}
+		}
+	}
+	if a.traderManager != nil && ev.TraderConfig != nil {
+		if runtimeTrader, err := a.traderManager.GetTrader(ev.TraderConfig.ID); err == nil && runtimeTrader != nil {
+			ev.Runtime = runtimeTrader.GetStatus()
+			if account, err := runtimeTrader.GetAccountInfo(); err == nil {
+				ev.Account = account
+			}
+			if positions, err := runtimeTrader.GetPositions(); err == nil {
+				ev.Positions = positions
+			}
+		}
+	}
+	if ev.TraderConfig != nil {
+		decisionArgs, _ := json.Marshal(map[string]any{"trader_id": ev.TraderConfig.ID, "limit": 5})
+		_ = json.Unmarshal([]byte(a.toolGetDecisions(storeUserID, string(decisionArgs))), &ev.Decisions)
+		logArgs, _ := json.Marshal(map[string]any{"trader_id": ev.TraderConfig.ID, "limit": 30, "errors_only": false})
+		_ = json.Unmarshal([]byte(a.toolGetBackendLogs(storeUserID, string(logArgs))), &ev.Logs)
+	}
+	return ev
+}
+
+func (a *Agent) generateTraderDiagnosisAnswerWithLLM(ctx context.Context, lang, userText string, ev traderDiagnosisEvidence) (string, bool) {
+	if a == nil || a.aiClient == nil || ev.TraderConfig == nil {
+		return "", false
+	}
+	evidenceJSON, err := json.MarshalIndent(ev, "", "  ")
+	if err != nil {
+		return "", false
+	}
+	stageCtx, cancel := withPlannerStageTimeout(ctx, directReplyTimeout)
+	defer cancel()
+	systemPrompt := `You are the trader diagnosis reasoning layer for NOFXi.
+You receive a complete evidence package collected by tools: trader config, bound model, bound exchange, bound strategy, account/positions, recent AI decisions, and backend logs.
+
+Your job:
+- Reason from the evidence and produce the final user-facing diagnosis in the user's language.
+- The answer must be short and useful: final cause + what the user should do.
+- Prefer recent AI decisions, order validation, exchange result, runtime/account/positions over scattered backend logs.
+- Do not expose evidence-package wording, tool names, raw logs, HTTP status codes, backend internals, or engineering troubleshooting unless the user explicitly asked for technical logs.
+- Do not invent subscriptions, data services, websites, missing product fields, or unsupported actions.
+- Never say "subscription expired" unless the evidence explicitly contains a confirmed subscription state.
+- If an order is blocked because the amount is too small, explain it as account size/order minimum/system limit. Do not suggest editing position_size_usd, min_position_size, max_positions, position value ratios, or other System enforced fields.
+- If the latest decision is wait/hold, explain that the trader is running and the AI chose to wait because the entry standard was not met.
+- If evidence is insufficient, say what is missing and the next concrete check.
+
+Return plain text only. No markdown tables.`
+	userPrompt := fmt.Sprintf("Language: %s\nUser question: %s\n\nEvidence JSON:\n%s", lang, userText, string(evidenceJSON))
+	raw, err := a.aiClient.CallWithRequest(&mcp.Request{
+		Messages: []mcp.Message{
+			mcp.NewSystemMessage(systemPrompt),
+			mcp.NewUserMessage(userPrompt),
+		},
+		Ctx: stageCtx,
+	})
+	if err != nil {
+		a.log().Warn("trader diagnosis LLM failed; using deterministic fallback", "error", err)
+		return "", false
+	}
+	answer := strings.TrimSpace(raw)
+	if answer == "" {
+		return "", false
+	}
+	return answer, true
+}
+
+func formatTraderDiagnosisEvidence(lang string, ev traderDiagnosisEvidence) string {
+	traderName := defaultIfEmpty(ev.TraderName, "未知交易员")
+	if ev.TraderConfig == nil {
+		if lang == "zh" {
+			return fmt.Sprintf("我没有找到交易员“%s”，所以没法继续诊断。", traderName)
+		}
+		return fmt.Sprintf("I could not find trader %q, so I cannot diagnose it yet.", traderName)
+	}
+	latest := struct {
+		Success             bool             `json:"success"`
+		ErrorMessage        string           `json:"error_message"`
+		AIRequestDurationMs int              `json:"ai_request_duration_ms"`
+		CandidateCoins      []string         `json:"candidate_coins"`
+		ExecutionLog        []string         `json:"execution_log"`
+		DecisionJSON        string           `json:"decision_json"`
+		Decisions           []map[string]any `json:"decisions"`
+	}{}
+	hasDecision := len(ev.Decisions.Records) > 0
+	if hasDecision {
+		latest = ev.Decisions.Records[0]
+	}
+	rawDecisions, _ := json.Marshal(ev.Decisions)
+	allEvidence := strings.ToLower(string(rawDecisions))
+	latestEvidence := strings.ToLower(strings.Join(append(append([]string{}, latest.ExecutionLog...), latest.ErrorMessage, latest.DecisionJSON), "\n"))
+	hasAmountTooSmall := containsAny(allEvidence, []string{"opening amount too small", "below minimum", "must be ≥", "must be >=", "position value below minimum"})
+	latestWait := containsAny(latestEvidence, []string{"wait succeeded", `"action":"wait"`, `"action":"hold"`})
+	primarySymbol := primaryDiagnosisSymbol(latest.CandidateCoins, latest.DecisionJSON)
+	amount, minimum := openingAmountAndMinimum(string(rawDecisions))
+	totalEquity := toFloat(ev.Account["total_equity"])
+	available := toFloat(ev.Account["available_balance"])
+	if available == 0 {
+		available = toFloat(ev.Account["available"])
+	}
+	var maxBTCETHPositionValue float64
+	if ev.Strategy != nil && ev.Strategy.Config != nil {
+		if risk, ok := nestedMap(ev.Strategy.Config, "ai_config", "risk_control"); ok {
+			maxBTCETHPositionValue = totalEquity * firstPositiveFloat(risk["btc_eth_max_position_value_ratio"], risk["btceth_max_position_value_ratio"])
+		}
+		if maxBTCETHPositionValue == 0 {
+			if risk, ok := ev.Strategy.Config["risk_control"].(map[string]any); ok {
+				maxBTCETHPositionValue = totalEquity * firstPositiveFloat(risk["btc_eth_max_position_value_ratio"], risk["btceth_max_position_value_ratio"])
+			}
+		}
+	}
+
+	if lang == "zh" {
+		lines := []string{}
+		switch {
+		case !ev.TraderConfig.IsRunning:
+			lines = append(lines, fmt.Sprintf("%s 现在没有运行，所以不会开单。", traderName))
+			lines = append(lines, "该怎么办：先启动这个交易员；启动后等它跑到下一个扫描周期，再看是否有新的 AI 决策。")
+		case strings.TrimSpace(ev.TraderConfig.AIModelID) == "":
+			lines = append(lines, fmt.Sprintf("%s 没有绑定 AI 模型，所以没法做交易决策。", traderName))
+			lines = append(lines, "该怎么办：先给这个交易员绑定一个已启用、可正常调用的模型。")
+		case ev.Model != nil && !modelEnabled(ev.Model):
+			lines = append(lines, fmt.Sprintf("%s 绑定的 AI 模型目前没有启用，所以没法稳定做交易决策。", traderName))
+			lines = append(lines, "该怎么办：启用当前模型，或者把交易员换到另一个可用模型。")
+		case strings.TrimSpace(ev.TraderConfig.ExchangeID) == "":
+			lines = append(lines, fmt.Sprintf("%s 没有绑定交易所账户，所以即使有信号也不能下单。", traderName))
+			lines = append(lines, "该怎么办：先绑定一个可用的交易所账户。")
+		case ev.Exchange != nil && !exchangeEnabled(ev.Exchange):
+			lines = append(lines, fmt.Sprintf("%s 绑定的交易所账户目前没有启用，所以不能下单。", traderName))
+			lines = append(lines, "该怎么办：启用这个交易所账户，或换成另一个可用账户。")
+		case hasAmountTooSmall:
+			summary := fmt.Sprintf("%s 不是没运行。最近它有尝试开 %s 的单，但账户资金太小，算出来的开仓金额", traderName, primarySymbol)
+			if amount > 0 {
+				summary += fmt.Sprintf("约 %.2f USDT", amount)
+			}
+			summary += "，低于系统最小下单要求"
+			if minimum > 0 {
+				summary += fmt.Sprintf(" %.2f USDT", minimum)
+			}
+			summary += "，所以这笔单被拦下了。"
+			lines = append(lines, summary)
+			if totalEquity > 0 && maxBTCETHPositionValue > 0 {
+				lines = append(lines, fmt.Sprintf("当前账户权益约 %.2f USDT，按策略风控算出来的单笔仓位上限约 %.2f USDT，容易达不到最小下单金额。", totalEquity, maxBTCETHPositionValue))
+			}
+			if latestWait {
+				lines = append(lines, "另外，最近也有一些周期是 AI 主动选择等待，说明并不是系统完全没跑。")
+			}
+			lines = append(lines, "该怎么办：增加账户资金，或者换更适合小资金的策略/标的。AI 智能策略里的最小开仓金额是系统限制，不能手动修改。")
+		case latestWait:
+			lines = append(lines, fmt.Sprintf("%s 是运行的，最近 AI 决策也成功了；它不开单的原因是当前信号没有达到入场标准，所以主动选择等待。", traderName))
+			lines = append(lines, "该怎么办：如果你想让它更容易出手，可以调整产品里真实可改的策略偏好，比如降低最低置信度或最低盈亏比；如果你更重视安全，就让它继续等待更明确的机会。")
+		case !hasDecision:
+			lines = append(lines, fmt.Sprintf("%s 目前没有读到最近 AI 决策记录，所以还不能证明它已经跑到完整决策周期。", traderName))
+			lines = append(lines, "该怎么办：确认交易员已启动，并等待一个扫描周期后再查；如果仍然没有决策记录，再检查运行状态和模型调用。")
+		case len(latest.CandidateCoins) == 0:
+			lines = append(lines, fmt.Sprintf("%s 最近没有拿到可交易候选币，所以没有进入开单。", traderName))
+			lines = append(lines, "该怎么办：检查策略的选币方式、指定币种或排除币设置，确认当前策略确实有可交易标的。")
+		case strings.TrimSpace(latest.ErrorMessage) != "":
+			lines = append(lines, fmt.Sprintf("%s 最近没有开单，是因为系统在决策或下单校验时返回了错误：%s", traderName, latest.ErrorMessage))
+			lines = append(lines, "该怎么办：先按这条错误处理；如果它涉及交易所权限、余额、仓位模式或最小下单金额，就优先处理对应账户或策略可编辑项。")
+		default:
+			lines = append(lines, fmt.Sprintf("%s 最近没有开单，但现有记录没有显示明确的拒单原因。", traderName))
+			lines = append(lines, "该怎么办：继续观察下一个扫描周期；如果连续没有开单，再重点看策略门槛、账户余额、交易所权限和模型调用是否正常。")
+		}
+		return strings.Join(lines, "\n")
+	}
+
+	lines := []string{}
+	switch {
+	case !ev.TraderConfig.IsRunning:
+		lines = append(lines, fmt.Sprintf("%s is not running, so it will not open trades.", traderName))
+	case hasAmountTooSmall:
+		lines = append(lines, fmt.Sprintf("%s did try to open a %s trade, but the calculated order size was below the system minimum, so it was blocked.", traderName, primarySymbol))
+	case latestWait:
+		lines = append(lines, fmt.Sprintf("%s is running, but the latest AI decision chose to wait because the signal did not meet its entry standard.", traderName))
+	case !hasDecision:
+		lines = append(lines, fmt.Sprintf("%s has no recent AI decision records yet, so there is not enough evidence that it completed a decision cycle.", traderName))
+	case len(latest.CandidateCoins) == 0:
+		lines = append(lines, fmt.Sprintf("%s has no tradable candidate coins in the latest decision, so it did not open a trade.", traderName))
+	case strings.TrimSpace(latest.ErrorMessage) != "":
+		lines = append(lines, fmt.Sprintf("%s did not open a trade because the latest decision/check returned: %s", traderName, latest.ErrorMessage))
+	default:
+		lines = append(lines, fmt.Sprintf("%s has no clear rejection reason in the latest records yet.", traderName))
+	}
+	lines = append(lines, "What to do: use the real editable product settings or account actions, such as adding funds, changing to a small-account-friendly symbol/strategy, or adjusting confidence/risk-reward preferences. Do not change system-enforced fields.")
+	return strings.Join(lines, "\n")
+}
+
+func primaryDiagnosisSymbol(candidates []string, decisionJSON string) string {
+	for _, candidate := range candidates {
+		if trimmed := strings.TrimSpace(candidate); trimmed != "" {
+			return trimmed
+		}
+	}
+	match := regexp.MustCompile(`(?i)"symbol"\s*:\s*"([^"]+)"`).FindStringSubmatch(decisionJSON)
+	if len(match) >= 2 && strings.TrimSpace(match[1]) != "" {
+		return strings.ToUpper(strings.TrimSpace(match[1]))
+	}
+	return "当前标的"
+}
+
+func openingAmountAndMinimum(evidence string) (float64, float64) {
+	amount := 0.0
+	minimum := 0.0
+	if match := regexp.MustCompile(`(?i)opening amount too small \((\d+(?:\.\d+)?)\s*USDT\)`).FindStringSubmatch(evidence); len(match) >= 2 {
+		amount, _ = strconv.ParseFloat(match[1], 64)
+	}
+	if amount == 0 {
+		if match := regexp.MustCompile(`(?i)"position_size_usd"\s*:\s*(\d+(?:\.\d+)?)`).FindStringSubmatch(evidence); len(match) >= 2 {
+			amount, _ = strconv.ParseFloat(match[1], 64)
+		}
+	}
+	if match := regexp.MustCompile(`(?:must be|must be ≥|>=|≥)\s*(\d+(?:\.\d+)?)\s*USDT`).FindStringSubmatch(evidence); len(match) >= 2 {
+		minimum, _ = strconv.ParseFloat(match[1], 64)
+	}
+	return amount, minimum
+}
+
+func nestedMap(root map[string]any, path ...string) (map[string]any, bool) {
+	var current any = root
+	for _, key := range path {
+		obj, ok := current.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		current, ok = obj[key]
+		if !ok {
+			return nil, false
+		}
+	}
+	obj, ok := current.(map[string]any)
+	return obj, ok
+}
+
+func firstPositiveFloat(values ...any) float64 {
+	for _, value := range values {
+		parsed := toFloat(value)
+		if parsed > 0 {
+			return parsed
+		}
+	}
+	return 0
+}
+
+func nonZeroPositions(positions []map[string]any) []map[string]any {
+	out := make([]map[string]any, 0, len(positions))
+	for _, position := range positions {
+		if toFloat(position["size"]) != 0 {
+			out = append(out, position)
+		}
+	}
+	return out
+}
+
+func joinAnyLines(values []any) string {
+	lines := make([]string, 0, len(values))
+	for _, value := range values {
+		switch typed := value.(type) {
+		case string:
+			lines = append(lines, typed)
+		default:
+			raw, _ := json.Marshal(typed)
+			if len(raw) > 0 {
+				lines = append(lines, string(raw))
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func valueOrUnset(value string) string {
+	return defaultIfEmpty(strings.TrimSpace(value), "未设置")
+}
+
+func modelName(model *safeModelToolConfig) string {
+	if model == nil {
+		return ""
+	}
+	return model.Name
+}
+
+func modelProvider(model *safeModelToolConfig) string {
+	if model == nil {
+		return ""
+	}
+	return model.Provider
+}
+
+func modelEnabled(model *safeModelToolConfig) bool {
+	return model != nil && model.Enabled
+}
+
+func exchangeName(exchange *safeExchangeToolConfig) string {
+	if exchange == nil {
+		return ""
+	}
+	return defaultIfEmpty(exchange.AccountName, exchange.ExchangeType)
+}
+
+func exchangeEnabled(exchange *safeExchangeToolConfig) bool {
+	return exchange != nil && exchange.Enabled
+}
+
+func strategyName(strategy *safeStrategyToolConfig) string {
+	if strategy == nil {
+		return ""
+	}
+	return strategy.Name
 }
 
 func (a *Agent) handleStrategyDiagnosisSkill(storeUserID, lang, text string) string {

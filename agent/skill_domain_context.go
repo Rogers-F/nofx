@@ -102,37 +102,25 @@ func buildSkillDomainPrimer(lang, skillName string) string {
 		fields := []string{
 			slotDisplayName("name", lang),
 			displayCatalogFieldName("strategy_type", lang),
-			displayCatalogFieldName("source_type", lang),
-			displayCatalogFieldName("primary_timeframe", lang),
-			displayCatalogFieldName("selected_timeframes", lang),
-			displayCatalogFieldName("custom_prompt", lang),
 		}
 		if lang == "zh" {
 			return strings.Join([]string{
 				"### 策略配置领域约束",
-				"- 策略围绕策略类型、选币来源、时间周期、风险参数和提示词展开。",
-				"- source_type 是选币来源，不是交易所，也不是模型。",
+				"- 本领域只处理策略模板。",
 				"- strategy_type 选项：ai_trading、grid_trading。",
-				"- source_type 选项：static、ai500、oi_top、oi_low、mixed。",
-				"- grid_trading 页面交易对选项：BTCUSDT、ETHUSDT、SOLUSDT、BNBUSDT、XRPUSDT、DOGEUSDT。",
-				"- grid_trading 页面范围：grid_count 5～50、total_investment 最小 100、leverage 1～5、atr_multiplier 1～5、max_drawdown_pct 5～50、stop_loss_pct 1～20、daily_loss_limit_pct 1～30、direction_bias_ratio 0.55～0.90。",
-				"- ai_trading 页面范围：static_coins 最多 10 个、selected_timeframes 最多 4 个、primary_count 10～30、min_confidence 50～100、min_risk_reward_ratio 1～10。",
-				"- 排行榜页面选项：duration 为 1h/4h/24h（价格榜还支持 1h,4h,24h），limit 为 5/10/15/20。",
-				"- max_positions、仓位价值占比、max_margin_usage、min_position_size 在策略页属于 System enforced / 非普通手动编辑项。",
+				"- 用户提到 AI500、OI Top、OI Low、静态币种/固定币种这类选币来源时，属于 ai_trading。",
+				"- 策略类型确定后，只能使用当前类型的产品编辑页模板。",
+				"- 策略类型未确定时，只判断类型，不要展示或混合任一分支的具体配置字段。",
 				"- 关键字段：" + strings.Join(fields, "、"),
 			}, "\n")
 		}
 		return strings.Join([]string{
 			"### Strategy Config Domain Guard",
-			"- Strategy configuration revolves around strategy type, coin source, timeframes, risk parameters, and prompts.",
-			"- source_type means the coin source, not an exchange or model.",
+			"- This domain only handles strategy templates.",
 			"- strategy_type options: ai_trading, grid_trading.",
-			"- source_type options: static, ai500, oi_top, oi_low, mixed.",
-			"- grid_trading symbol dropdown: BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, XRPUSDT, DOGEUSDT.",
-			"- grid_trading page ranges: grid_count 5-50, total_investment >=100, leverage 1-5, atr_multiplier 1-5, max_drawdown_pct 5-50, stop_loss_pct 1-20, daily_loss_limit_pct 1-30, direction_bias_ratio 0.55-0.90.",
-			"- ai_trading page ranges: static_coins at most 10, selected_timeframes at most 4, primary_count 10-30, min_confidence 50-100, min_risk_reward_ratio 1-10.",
-			"- Ranking page options: duration 1h/4h/24h (price ranking also supports 1h,4h,24h), limit 5/10/15/20.",
-			"- max_positions, position value ratios, max_margin_usage, and min_position_size are System enforced / not ordinary manual fields on the strategy page.",
+			"- AI500, OI Top, OI Low, and static coin-source requests imply ai_trading.",
+			"- Once strategy_type is known, use only that product editor template.",
+			"- Before strategy_type is known, only determine the type; do not show or mix concrete fields from either branch.",
 			"- Key fields: " + strings.Join(fields, ", "),
 		}, "\n")
 	default:
@@ -140,12 +128,82 @@ func buildSkillDomainPrimer(lang, skillName string) string {
 	}
 }
 
-func buildManagementDomainPrimer(lang string) string {
-	parts := []string{
-		buildSkillDomainPrimer(lang, "model_management"),
-		buildSkillDomainPrimer(lang, "exchange_management"),
-		buildSkillDomainPrimer(lang, "trader_management"),
-		buildSkillDomainPrimer(lang, "strategy_management"),
+func buildSkillDomainPrimerForSession(lang string, session skillSession) string {
+	if session.Name != "strategy_management" {
+		return buildSkillDomainPrimer(lang, session.Name)
 	}
-	return strings.Join(filterNonEmptyStrings(parts), "\n\n")
+	strategyType := explicitStrategyCreateType(session)
+	if strategyType == "" {
+		return buildSkillDomainPrimer(lang, session.Name)
+	}
+	if lang == "zh" {
+		switch strategyType {
+		case "ai_trading":
+			return strings.Join([]string{
+				"### AI 策略模板",
+				"- 只使用 ai_trading 模板：strategy_type + ai_config + publish_config。",
+				"- config_patch 必须使用产品 schema 原值，不要使用展示文案：strategy_type=ai_trading；source_type 只能是 static、ai500、oi_top、oi_low；没有 mixed/混合模式。",
+				"- 时间周期必须输出为产品枚举字符串，例如 1m、3m、5m、15m、1h；selected_timeframes 必须是字符串数组，例如 [\"1m\",\"5m\",\"15m\"]，不要输出 JSON 字符串。",
+				"- AI500/OI Top/OI Low 选币数量范围 1～10；static_coins 最多 10 个；selected_timeframes 最多 4 个；primary_count 10～30。",
+				"- BTC/ETH 最大杠杆 1～20；山寨币最大杠杆 1～20；min_confidence 50～100；min_risk_reward_ratio 1～10。",
+				"- AI 策略创建方案不要展示或询问非 AI 模板字段：投入金额、每笔固定投入、止损、日亏损限制、最大回撤、网格字段。",
+			}, "\n")
+		case "grid_trading":
+			return strings.Join([]string{
+				"### 网格策略模板",
+				"- 只使用 grid_trading 模板：strategy_type + grid_config + publish_config；config_patch 必须使用产品 schema 原值，strategy_type=grid_trading。",
+				"- 交易对选项：BTCUSDT、ETHUSDT、SOLUSDT、BNBUSDT、XRPUSDT、DOGEUSDT。",
+				"- grid_count 5～50；total_investment 最小 100；leverage 1～5；atr_multiplier 1～5。",
+				"- total_investment 是用户实际投入/保证金预算，不是杠杆后的名义仓位；最大名义仓位约等于 total_investment × leverage。用户说“投入/总投入/本金/保证金”时默认映射到 total_investment。",
+				"- max_drawdown_pct 5～50；stop_loss_pct 1～20；daily_loss_limit_pct 1～30；direction_bias_ratio 0.55～0.90。",
+				"- 没有实时行情工具结果时，不要猜当前价格或手动价格上下界；推荐 use_atr_bounds=true 的 ATR 自动边界。",
+				"- 如果用户让你选择/推荐剩余网格参数，价格区间默认写入 use_atr_bounds=true；不要反问用户手动价格区间，也不要编造“当前 BTC/ETH 在某价附近”。",
+			}, "\n")
+		}
+	}
+	switch strategyType {
+	case "ai_trading":
+		return strings.Join([]string{
+			"### AI Strategy Template",
+			"- Use only ai_trading: strategy_type + ai_config + publish_config.",
+			"- config_patch must use product schema raw values, not display labels: strategy_type=ai_trading; source_type is only static, ai500, oi_top, or oi_low; no mixed mode.",
+			"- Timeframes must be product enum strings such as 1m, 3m, 5m, 15m, 1h; selected_timeframes must be a JSON string array such as [\"1m\",\"5m\",\"15m\"], not a JSON-encoded string.",
+			"- AI500/OI source counts 1-10; static_coins at most 10; selected_timeframes at most 4; primary_count 10-30.",
+			"- BTC/ETH leverage 1-20; altcoin leverage 1-20; min_confidence 50-100; min_risk_reward_ratio 1-10.",
+			"- Do not show or ask for non-AI-template fields in AI strategy drafts: investment amount, fixed per-trade amount, stop loss, daily loss limit, max drawdown, or grid fields.",
+		}, "\n")
+	case "grid_trading":
+		return strings.Join([]string{
+			"### Grid Strategy Template",
+			"- Use only grid_trading: strategy_type + grid_config + publish_config; config_patch must use product schema raw values with strategy_type=grid_trading.",
+			"- Symbol options: BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, XRPUSDT, DOGEUSDT.",
+			"- grid_count 5-50; total_investment >=100; leverage 1-5; atr_multiplier 1-5.",
+			"- total_investment is the user's actual capital/margin budget, not leveraged notional exposure; maximum notional exposure is approximately total_investment * leverage. When the user says investment, capital, amount to put in, or margin, map it to total_investment by default.",
+			"- max_drawdown_pct 5-50; stop_loss_pct 1-20; daily_loss_limit_pct 1-30; direction_bias_ratio 0.55-0.90.",
+			"- Without fresh market data, do not guess the current price or manual upper/lower prices; recommend ATR auto bounds with use_atr_bounds=true.",
+			"- If the user asks you to choose/recommend the remaining grid parameters, default the price range to use_atr_bounds=true; do not ask for manual price bounds or invent statements like the current BTC/ETH price is near a value.",
+		}, "\n")
+	}
+	return buildSkillDomainPrimer(lang, session.Name)
+}
+
+func buildManagementDomainPrimer(lang string) string {
+	if lang == "zh" {
+		return strings.Join([]string{
+			"### 管理领域路由速记",
+			"- 模型/API Key/provider：model_management。",
+			"- 交易所账户/API 凭证：exchange_management。",
+			"- 交易员创建、启动、停止、绑定策略/模型/交易所：trader_management。",
+			"- 策略模板创建、查看、修改、删除、激活、复制：strategy_management。",
+			"- 这里只用于路由；具体字段和模板只在进入对应 skill 后注入。",
+		}, "\n")
+	}
+	return strings.Join([]string{
+		"### Management Routing Cheat Sheet",
+		"- Model/API key/provider: model_management.",
+		"- Exchange account/API credentials: exchange_management.",
+		"- Trader create/start/stop/bind strategy/model/exchange: trader_management.",
+		"- Strategy template create/query/update/delete/activate/duplicate: strategy_management.",
+		"- This is only for routing; detailed fields/templates are injected after entering the selected skill.",
+	}, "\n")
 }

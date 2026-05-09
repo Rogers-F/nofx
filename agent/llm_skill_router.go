@@ -257,6 +257,9 @@ Return JSON with this exact shape:
 }
 
 func (a *Agent) executeUnifiedTurnDecision(ctx context.Context, storeUserID string, userID int64, lang, text string, decision unifiedTurnDecision, onEvent func(event, data string)) (string, bool, error) {
+	if session, ok := a.activeStrategyCreateSession(userID); ok && strategyCreateConfirmationReply(text) {
+		return a.driveActiveSession(ctx, storeUserID, userID, lang, text, session, onEvent)
+	}
 	switch decision.TopicIntent {
 	case "cancel":
 		a.clearPendingProposalSession(userID)
@@ -344,6 +347,9 @@ func (a *Agent) executeUnifiedTurnDecision(ctx context.Context, storeUserID stri
 		mergeExtractedData(&activeSession, decision.ExtractedData)
 		return a.driveActiveSession(ctx, storeUserID, userID, lang, text, activeSession, onEvent)
 	case "planned_agent":
+		if session, ok := a.activeStrategyCreateSession(userID); ok {
+			return a.driveActiveSession(ctx, storeUserID, userID, lang, text, session, onEvent)
+		}
 		contextMode := decision.ContextMode
 		if contextMode == "resume_snapshot" {
 			contextMode = "use_current"
@@ -361,6 +367,23 @@ func (a *Agent) executeUnifiedSkillTasks(ctx context.Context, storeUserID string
 	tasks := normalizeWorkflowDecomposition(workflowDecomposition{Tasks: decision.Tasks}).Tasks
 	if len(tasks) == 0 {
 		return "", false, nil
+	}
+	if task, ok := strategyCreateWorkflowTask(tasks); ok {
+		if a.hasAnyActiveContext(userID) && decision.ContextMode == "fresh_context" {
+			if !a.suspendActiveContexts(userID, lang) {
+				a.clearSkillSession(userID)
+				a.clearWorkflowSession(userID)
+				a.clearExecutionState(userID)
+			}
+			a.clearActiveSkillSession(userID)
+		}
+		a.clearWorkflowSession(userID)
+		a.clearExecutionState(userID)
+		session := newActiveSkillSession(userID, task.Skill, task.Action)
+		session.Goal = defaultIfEmpty(strings.TrimSpace(task.Request), strings.TrimSpace(text))
+		decision.ExtractedData = filterExtractedDataForActiveSession(session, decision.ExtractedData, lang)
+		mergeExtractedData(&session, decision.ExtractedData)
+		return a.driveActiveSession(ctx, storeUserID, userID, lang, defaultIfEmpty(task.Request, text), session, onEvent)
 	}
 	if a.hasAnyActiveContext(userID) && decision.ContextMode == "fresh_context" {
 		if !a.suspendActiveContexts(userID, lang) {
@@ -388,6 +411,15 @@ func (a *Agent) executeUnifiedSkillTasks(ctx context.Context, storeUserID string
 	}
 	a.saveWorkflowSession(userID, session)
 	return a.maybeAdvanceWorkflow(ctx, storeUserID, userID, lang, session, onEvent)
+}
+
+func strategyCreateWorkflowTask(tasks []WorkflowTask) (WorkflowTask, bool) {
+	for _, task := range tasks {
+		if strings.TrimSpace(task.Skill) == "strategy_management" && strings.TrimSpace(task.Action) == "create" {
+			return task, true
+		}
+	}
+	return WorkflowTask{}, false
 }
 
 func buildTopLevelActiveFlowSummary(lang string, skill skillSession, activeTask ActiveSkillSession, hasActiveTask bool, workflow WorkflowSession, state ExecutionState, pendingProposal PendingProposalSession, hasPendingProposal bool) string {

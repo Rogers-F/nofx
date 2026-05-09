@@ -252,7 +252,10 @@ func allowedFieldSpecsForSkillSession(session skillSession, lang string) []llmFl
 		add(&out, "show_in_competition", displayCatalogFieldName("show_in_competition", lang), false)
 	case "strategy_management":
 		if session.Action == "create" || session.Action == "update_config" {
-			configPatchDescription := "Partial StrategyConfig JSON patch inferred from the user's strategy intent."
+			if session.Action == "create" {
+				add(&out, "strategy_type", "Strategy type. Use ai_trading for AI strategies, including AI500/OI/static coin-source requests; use grid_trading only for grid strategy requests.", false)
+			}
+			configPatchDescription := "Partial StrategyConfig JSON patch inferred from the user's strategy intent. Use exact product schema values, not display labels: source_type must be one of static, ai500, oi_top, oi_low; strategy_type must be ai_trading or grid_trading; selected_timeframes must be a JSON array of strings, not a JSON-encoded string."
 			switch explicitStrategyCreateType(session) {
 			case "grid_trading":
 				configPatchDescription += " Current strategy_type is grid_trading: use only top-level strategy_type, grid_config, publish_config, and language. Do not output ai_config or AI fields such as coin_source, indicators, risk_control, timeframes, confidence, or prompt_sections."
@@ -271,10 +274,12 @@ func allowedFieldSpecsForSkillSession(session skillSession, lang string) []llmFl
 			add(&out, "custom_prompt", strategyConfigFieldDisplayName("custom_prompt", lang), false)
 		}
 		if session.Action == "update_config" {
-			add(&out, "config_field", strategyConfigFieldDisplayName("config_field", lang), false)
-			add(&out, "config_value", strategyConfigFieldDisplayName("config_value", lang), false)
+			return out
 		}
 		add(&out, "name", slotDisplayName("name", lang), true)
+		if session.Action == "create" {
+			return out
+		}
 		keys := manualStrategyEditableFieldKeys()
 		if strategyType := explicitStrategyCreateType(session); strategyType != "" {
 			keys = manualStrategyEditableFieldKeysForType(strategyType)
@@ -424,13 +429,8 @@ func missingFieldKeysForSkillSession(session skillSession) []string {
 				missing = append(missing, "prompt")
 			}
 		case "update_config":
-			if fieldValue(session, "config_patch") != "" {
-				break
-			}
-			if fieldValue(session, "config_field") == "" {
-				missing = append(missing, "config_field")
-			} else if fieldValue(session, "config_value") == "" {
-				missing = append(missing, "config_value")
+			if fieldValue(session, "config_patch") == "" {
+				missing = append(missing, "config_patch")
 			}
 		case "create":
 			if fieldValue(session, "name") == "" {
@@ -551,13 +551,22 @@ func (a *Agent) applyLLMExtractionToSkillSession(storeUserID string, session *sk
 				setField(session, "name", value)
 				continue
 			}
-			if key == "config_field" || key == "config_value" {
-				setField(session, key, value)
-				continue
-			}
-			if session.Action == "update_config" {
-				setField(session, "config_field", key)
-				setField(session, "config_value", value)
+			if session.Action == "create" || session.Action == "update_config" {
+				switch key {
+				case "strategy_type":
+					if strategyType := parseStrategyTypeValue(value); strategyType != "" {
+						setStrategyCreateType(session, strategyType)
+					}
+				case strategyCreateConfigPatchField:
+					strategyType := explicitStrategyCreateType(*session)
+					if strategyType == "" {
+						strategyType = strategyTypeFromConfigPatchAny(value)
+					}
+					if sanitized := sanitizeStrategyCreateConfigPatchForType(value, strategyType); len(sanitized) > 0 {
+						raw, _ := json.Marshal(sanitized)
+						setField(session, strategyCreateConfigPatchField, string(raw))
+					}
+				}
 				continue
 			}
 			cfg := unmarshalStrategyCreateDraft(fieldValue(*session, strategyCreateDraftConfigField), lang)

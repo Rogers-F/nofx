@@ -94,11 +94,11 @@ func plannerToolNamesForDomain(domain string) []string {
 	case "strategy":
 		return []string{"get_strategies", "manage_strategy"}
 	case "diagnosis":
-		return []string{"get_backend_logs", "get_model_configs", "get_exchange_configs", "get_strategies", "manage_trader"}
+		return []string{"get_decisions", "get_backend_logs", "get_model_configs", "get_exchange_configs", "get_strategies", "manage_trader"}
 	default:
 		return []string{
 			"get_preferences", "manage_preferences",
-			"get_backend_logs",
+			"get_decisions", "get_backend_logs",
 			"get_exchange_configs", "manage_exchange_config",
 			"get_model_configs", "manage_model_config",
 			"get_strategies", "manage_strategy",
@@ -280,18 +280,15 @@ func strategyConfigSchema() map[string]any {
 					"coin_source": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
-							"source_type":      map[string]any{"type": "string", "enum": []string{"static", "ai500", "oi_top", "oi_low", "mixed"}, "description": "Manual page coin source: static, ai500, oi_top, oi_low; mixed can be displayed when already configured."},
-							"static_coins":     stringArraySchema("Static coin symbols such as BTCUSDT or ETHUSDT. Manual page allows at most 10. xyz: assets such as xyz:TSLA, xyz:GOLD, xyz:XYZ100 are also supported."),
-							"excluded_coins":   stringArraySchema("Coin symbols to exclude from all sources."),
-							"use_ai500":        map[string]any{"type": "boolean"},
-							"ai500_limit":      map[string]any{"type": "number", "minimum": 1, "maximum": 10, "description": "Manual page range 1-10."},
-							"use_oi_top":       map[string]any{"type": "boolean"},
-							"oi_top_limit":     map[string]any{"type": "number", "minimum": 1, "maximum": 10, "description": "Manual page range 1-10."},
-							"use_oi_low":       map[string]any{"type": "boolean"},
-							"oi_low_limit":     map[string]any{"type": "number", "minimum": 1, "maximum": 10, "description": "Manual page range 1-10."},
-							"use_hyper_all":    map[string]any{"type": "boolean"},
-							"use_hyper_main":   map[string]any{"type": "boolean"},
-							"hyper_main_limit": map[string]any{"type": "number"},
+							"source_type":    map[string]any{"type": "string", "enum": []string{"static", "ai500", "oi_top", "oi_low"}, "description": "Manual page coin source: static, ai500, oi_top, oi_low."},
+							"static_coins":   stringArraySchema("Static coin symbols such as BTCUSDT or ETHUSDT. Manual page allows at most 10. xyz: assets such as xyz:TSLA, xyz:GOLD, xyz:XYZ100 are also supported."),
+							"excluded_coins": stringArraySchema("Coin symbols to exclude from all sources."),
+							"use_ai500":      map[string]any{"type": "boolean"},
+							"ai500_limit":    map[string]any{"type": "number", "minimum": 1, "maximum": 10, "description": "Manual page range 1-10."},
+							"use_oi_top":     map[string]any{"type": "boolean"},
+							"oi_top_limit":   map[string]any{"type": "number", "minimum": 1, "maximum": 10, "description": "Manual page range 1-10."},
+							"use_oi_low":     map[string]any{"type": "boolean"},
+							"oi_low_limit":   map[string]any{"type": "number", "minimum": 1, "maximum": 10, "description": "Manual page range 1-10."},
 						},
 					},
 					"indicators": map[string]any{
@@ -340,14 +337,10 @@ func strategyConfigSchema() map[string]any {
 					"risk_control": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
-							"max_positions":                    map[string]any{"type": "number", "description": "Displayed as System enforced on the manual strategy page; do not change unless the user explicitly asks for advanced configuration."},
-							"btc_eth_max_leverage":             map[string]any{"type": "number", "minimum": 1, "maximum": 20},
-							"altcoin_max_leverage":             map[string]any{"type": "number", "minimum": 1, "maximum": 20},
-							"btc_eth_max_position_value_ratio": map[string]any{"type": "number", "description": "Displayed as System enforced on the manual strategy page; do not change unless explicitly requested."},
-							"altcoin_max_position_value_ratio": map[string]any{"type": "number", "description": "Displayed as System enforced on the manual strategy page; do not change unless explicitly requested."},
-							"max_margin_usage":                 map[string]any{"type": "number", "description": "Displayed as System enforced on the manual strategy page; do not change unless explicitly requested."},
-							"min_risk_reward_ratio":            map[string]any{"type": "number", "minimum": 1, "maximum": 10, "description": "Manual page range 1-10, step 0.5."},
-							"min_confidence":                   map[string]any{"type": "number", "minimum": 50, "maximum": 100, "description": "Manual page range 50-100."},
+							"btc_eth_max_leverage":  map[string]any{"type": "number", "minimum": 1, "maximum": 20},
+							"altcoin_max_leverage":  map[string]any{"type": "number", "minimum": 1, "maximum": 20},
+							"min_risk_reward_ratio": map[string]any{"type": "number", "minimum": 1, "maximum": 10, "description": "Manual page range 1-10, step 0.5."},
+							"min_confidence":        map[string]any{"type": "number", "minimum": 50, "maximum": 100, "description": "Manual page range 50-100."},
 						},
 					},
 					"prompt_sections": map[string]any{
@@ -367,7 +360,7 @@ func strategyConfigSchema() map[string]any {
 				"properties": map[string]any{
 					"symbol":                  map[string]any{"type": "string", "enum": []string{"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT"}, "description": "Manual page dropdown options for grid trading symbols."},
 					"grid_count":              map[string]any{"type": "number", "minimum": 5, "maximum": 50, "description": "Manual page range 5-50."},
-					"total_investment":        map[string]any{"type": "number", "minimum": 100, "description": "Manual page minimum 100 USDT."},
+					"total_investment":        map[string]any{"type": "number", "minimum": 100, "description": "User's actual capital/margin budget for the grid strategy, not leveraged notional exposure. Minimum 100 USDT."},
 					"leverage":                map[string]any{"type": "number", "minimum": 1, "maximum": 5, "description": "Manual page range 1-5."},
 					"upper_price":             map[string]any{"type": "number"},
 					"lower_price":             map[string]any{"type": "number"},
@@ -525,6 +518,21 @@ func buildAgentTools() []mcp.Tool {
 						"trader_name": map[string]any{"type": "string", "description": "Trader name to diagnose. Used to look up the trader when id is not known."},
 						"limit":       map[string]any{"type": "number", "description": "Maximum number of recent log lines to return. Default 30."},
 						"errors_only": map[string]any{"type": "boolean", "description": "When true, only return error-like log lines. Default true."},
+					},
+				},
+			},
+		},
+		{
+			Type: "function",
+			Function: mcp.FunctionDef{
+				Name:        "get_decisions",
+				Description: "Get recent AI decision records for a trader diagnosis. Use this before concluding why a trader is not opening orders: it shows candidate coins, wait/hold/open decisions, validation errors, execution logs, and AI call duration.",
+				Parameters: map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"trader_id":   map[string]any{"type": "string", "description": "Trader id to diagnose."},
+						"trader_name": map[string]any{"type": "string", "description": "Trader name to diagnose. Used to look up the trader when id is not known."},
+						"limit":       map[string]any{"type": "number", "description": "Maximum number of recent decision records to return. Default 5, max 20."},
 					},
 				},
 			},
@@ -868,6 +876,8 @@ func (a *Agent) handleToolCall(ctx context.Context, storeUserID string, userID i
 		return a.toolManagePreferences(userID, tc.Function.Arguments)
 	case "get_backend_logs":
 		return a.toolGetBackendLogs(storeUserID, tc.Function.Arguments)
+	case "get_decisions":
+		return a.toolGetDecisions(storeUserID, tc.Function.Arguments)
 	case "get_exchange_configs":
 		return a.toolGetExchangeConfigs(storeUserID)
 	case "manage_exchange_config":
@@ -887,9 +897,9 @@ func (a *Agent) handleToolCall(ctx context.Context, storeUserID string, userID i
 	case "execute_trade":
 		return a.toolExecuteTrade(ctx, userID, lang, tc.Function.Arguments)
 	case "get_positions":
-		return a.toolGetPositions()
+		return a.toolGetPositions(storeUserID)
 	case "get_balance":
-		return a.toolGetBalance()
+		return a.toolGetBalance(storeUserID)
 	case "get_market_price":
 		return a.toolGetMarketPrice(tc.Function.Arguments)
 	case "get_market_snapshot":
@@ -1296,6 +1306,34 @@ func filterBackendLogEntriesAny(entries []string, needles ...string) []string {
 	return filtered
 }
 
+func (a *Agent) resolveTraderForTool(storeUserID, traderID, traderName string) (*store.Trader, error) {
+	traderID = strings.TrimSpace(traderID)
+	traderName = strings.TrimSpace(traderName)
+	if traderID == "" && traderName == "" {
+		return nil, fmt.Errorf("trader_id or trader_name is required")
+	}
+	if traderID != "" {
+		traderCfg, err := a.store.Trader().GetByID(traderID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load trader: %w", err)
+		}
+		if traderCfg.UserID != storeUserID {
+			return nil, fmt.Errorf("trader not found for current user")
+		}
+		return traderCfg, nil
+	}
+	traders, err := a.store.Trader().List(storeUserID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list traders: %w", err)
+	}
+	for _, traderCfg := range traders {
+		if strings.EqualFold(strings.TrimSpace(traderCfg.Name), traderName) {
+			return traderCfg, nil
+		}
+	}
+	return nil, fmt.Errorf("trader %q not found", traderName)
+}
+
 func (a *Agent) toolGetBackendLogs(storeUserID, argsJSON string) string {
 	var args struct {
 		TraderID   string `json:"trader_id"`
@@ -1315,42 +1353,15 @@ func (a *Agent) toolGetBackendLogs(storeUserID, argsJSON string) string {
 	if args.ErrorsOnly != nil {
 		errorsOnly = *args.ErrorsOnly
 	}
-	traderID := strings.TrimSpace(args.TraderID)
-	traderName := strings.TrimSpace(args.TraderName)
-	if traderID == "" && traderName == "" {
-		return `{"error":"trader_id or trader_name is required"}`
-	}
-	// resolve by name if id not provided
-	if traderID == "" {
-		traders, err := a.store.Trader().List(storeUserID)
-		if err != nil {
-			return fmt.Sprintf(`{"error":"failed to list traders: %s"}`, err)
-		}
-		for _, t := range traders {
-			if strings.EqualFold(strings.TrimSpace(t.Name), traderName) {
-				traderID = t.ID
-				traderName = t.Name
-				break
-			}
-		}
-		if traderID == "" {
-			return fmt.Sprintf(`{"error":"trader %q not found"}`, traderName)
-		}
-	} else {
-		trader, err := a.store.Trader().GetByID(traderID)
-		if err != nil {
-			return fmt.Sprintf(`{"error":"failed to load trader: %s"}`, err)
-		}
-		if trader.UserID != storeUserID {
-			return `{"error":"trader not found for current user"}`
-		}
-		traderName = trader.Name
+	traderCfg, err := a.resolveTraderForTool(storeUserID, args.TraderID, args.TraderName)
+	if err != nil {
+		return fmt.Sprintf(`{"error":"%s"}`, err)
 	}
 	path, entries, err := readBackendLogEntries(args.Limit, "", errorsOnly)
 	if err != nil {
 		return fmt.Sprintf(`{"error":"failed to read backend logs: %s"}`, err)
 	}
-	entries = filterBackendLogEntriesAny(entries, traderID, traderName)
+	entries = filterBackendLogEntriesAny(entries, traderCfg.ID, traderCfg.Name)
 	if args.Limit <= 0 {
 		args.Limit = 30
 	}
@@ -1358,12 +1369,65 @@ func (a *Agent) toolGetBackendLogs(storeUserID, argsJSON string) string {
 		entries = entries[len(entries)-args.Limit:]
 	}
 	result, _ := json.Marshal(map[string]any{
-		"trader_id":   traderID,
-		"trader_name": traderName,
+		"trader_id":   traderCfg.ID,
+		"trader_name": traderCfg.Name,
 		"log_file":    path,
 		"entries":     entries,
 		"count":       len(entries),
 		"errors_only": errorsOnly,
+	})
+	return string(result)
+}
+
+func (a *Agent) toolGetDecisions(storeUserID, argsJSON string) string {
+	var args struct {
+		TraderID   string `json:"trader_id"`
+		TraderName string `json:"trader_name"`
+		Limit      int    `json:"limit"`
+	}
+	if strings.TrimSpace(argsJSON) != "" {
+		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+			return fmt.Sprintf(`{"error":"invalid arguments: %s"}`, err)
+		}
+	}
+	if a.store == nil {
+		return `{"error":"store unavailable"}`
+	}
+	traderCfg, err := a.resolveTraderForTool(storeUserID, args.TraderID, args.TraderName)
+	if err != nil {
+		return fmt.Sprintf(`{"error":"%s"}`, err)
+	}
+	limit := args.Limit
+	if limit <= 0 {
+		limit = 5
+	}
+	if limit > 20 {
+		limit = 20
+	}
+	records, err := a.store.Decision().GetLatestRecords(traderCfg.ID, limit)
+	if err != nil {
+		return fmt.Sprintf(`{"error":"failed to get decision records: %s"}`, err)
+	}
+	items := make([]map[string]any, 0, len(records))
+	for _, record := range records {
+		items = append(items, map[string]any{
+			"id":                     record.ID,
+			"cycle_number":           record.CycleNumber,
+			"timestamp":              record.Timestamp,
+			"success":                record.Success,
+			"error_message":          record.ErrorMessage,
+			"ai_request_duration_ms": record.AIRequestDurationMs,
+			"candidate_coins":        record.CandidateCoins,
+			"execution_log":          record.ExecutionLog,
+			"decisions":              record.Decisions,
+			"decision_json":          record.DecisionJSON,
+		})
+	}
+	result, _ := json.Marshal(map[string]any{
+		"trader_id":   traderCfg.ID,
+		"trader_name": traderCfg.Name,
+		"count":       len(items),
+		"records":     items,
 	})
 	return string(result)
 }
@@ -2739,13 +2803,27 @@ func (a *Agent) toolExecuteTrade(ctx context.Context, userID int64, lang, argsJS
 	return string(result)
 }
 
-func (a *Agent) toolGetPositions() string {
+func (a *Agent) toolGetPositions(storeUserID string) string {
 	if a.traderManager == nil {
 		return `{"error": "no trader manager configured"}`
 	}
+	if a.store == nil {
+		return `{"error": "store unavailable"}`
+	}
+	traderConfigs, err := a.store.Trader().List(storeUserID)
+	if err != nil {
+		return fmt.Sprintf(`{"error": "failed to list traders: %s"}`, err)
+	}
 
 	var positions []map[string]any
-	for id, t := range a.traderManager.GetAllTraders() {
+	for _, traderCfg := range traderConfigs {
+		if strings.TrimSpace(traderCfg.ID) == "" {
+			continue
+		}
+		t, err := a.traderManager.GetTrader(traderCfg.ID)
+		if err != nil {
+			continue
+		}
 		pos, err := t.GetPositions()
 		if err != nil {
 			continue
@@ -2755,7 +2833,7 @@ func (a *Agent) toolGetPositions() string {
 			if size == 0 {
 				continue
 			}
-			tid := id
+			tid := traderCfg.ID
 			if len(tid) > 8 {
 				tid = tid[:8]
 			}
@@ -2781,18 +2859,32 @@ func (a *Agent) toolGetPositions() string {
 	return string(result)
 }
 
-func (a *Agent) toolGetBalance() string {
+func (a *Agent) toolGetBalance(storeUserID string) string {
 	if a.traderManager == nil {
 		return `{"error": "no trader manager configured"}`
 	}
+	if a.store == nil {
+		return `{"error": "store unavailable"}`
+	}
+	traderConfigs, err := a.store.Trader().List(storeUserID)
+	if err != nil {
+		return fmt.Sprintf(`{"error": "failed to list traders: %s"}`, err)
+	}
 
 	var balances []map[string]any
-	for id, t := range a.traderManager.GetAllTraders() {
+	for _, traderCfg := range traderConfigs {
+		if strings.TrimSpace(traderCfg.ID) == "" {
+			continue
+		}
+		t, err := a.traderManager.GetTrader(traderCfg.ID)
+		if err != nil {
+			continue
+		}
 		info, err := t.GetAccountInfo()
 		if err != nil {
 			continue
 		}
-		tid := id
+		tid := traderCfg.ID
 		if len(tid) > 8 {
 			tid = tid[:8]
 		}
@@ -3081,6 +3173,26 @@ func maxInt(a, b int) int {
 
 func strategyLockedFieldError(lang, field string) string {
 	switch strings.TrimSpace(field) {
+	case "max_positions":
+		if lang == "zh" {
+			return "最大持仓数是 System enforced 字段，策略编辑页不提供普通输入控件，Agent 不能修改。"
+		}
+		return "Max positions is System enforced in the strategy editor and cannot be changed by the agent."
+	case "btceth_max_position_value_ratio":
+		if lang == "zh" {
+			return "BTC/ETH 单币仓位上限是 System enforced 字段，策略编辑页不提供普通输入控件，Agent 不能修改。"
+		}
+		return "BTC/ETH position value ratio is System enforced in the strategy editor and cannot be changed by the agent."
+	case "altcoin_max_position_value_ratio":
+		if lang == "zh" {
+			return "山寨币单币仓位上限是 System enforced 字段，策略编辑页不提供普通输入控件，Agent 不能修改。"
+		}
+		return "Altcoin position value ratio is System enforced in the strategy editor and cannot be changed by the agent."
+	case "max_margin_usage":
+		if lang == "zh" {
+			return "最大保证金使用率是 System enforced 字段，策略编辑页不提供普通输入控件，Agent 不能修改。"
+		}
+		return "Max margin usage is System enforced in the strategy editor and cannot be changed by the agent."
 	case "min_position_size":
 		if lang == "zh" {
 			return "最小开仓金额是系统固定值 12 USDT，手动面板里也是 System enforced，Agent 不能修改。"
@@ -3102,8 +3214,19 @@ func strategyConfigContainsLockedField(config map[string]any) (string, bool) {
 		return "min_position_size", true
 	}
 	if risk, ok := config["risk_control"].(map[string]any); ok {
-		if _, ok := risk["min_position_size"]; ok {
-			return "min_position_size", true
+		for _, field := range []string{"max_positions", "btc_eth_max_position_value_ratio", "btceth_max_position_value_ratio", "altcoin_max_position_value_ratio", "max_margin_usage", "min_position_size"} {
+			if _, ok := risk[field]; ok {
+				return field, true
+			}
+		}
+	}
+	if aiConfig, ok := config["ai_config"].(map[string]any); ok {
+		if risk, ok := aiConfig["risk_control"].(map[string]any); ok {
+			for _, field := range []string{"max_positions", "btc_eth_max_position_value_ratio", "btceth_max_position_value_ratio", "altcoin_max_position_value_ratio", "max_margin_usage", "min_position_size"} {
+				if _, ok := risk[field]; ok {
+					return field, true
+				}
+			}
 		}
 	}
 	return "", false

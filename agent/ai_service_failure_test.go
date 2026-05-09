@@ -53,6 +53,32 @@ func TestAIServiceFailureHighlightsUpstreamEmptyOutputRateLimit(t *testing.T) {
 	}
 }
 
+func TestAIServiceFailureHighlightsBannedAccountAuthFailure(t *testing.T) {
+	a := New(nil, nil, DefaultConfig(), slog.Default())
+
+	msg, err := a.aiServiceFailure("zh", errors.New(`API returned error (status 401): {"error":{"code":"authentication_failed","message":"login failed: USER_IS_BANNED","param":null,"type":"authentication_error"}}`))
+	if err != nil {
+		t.Fatalf("aiServiceFailure returned error: %v", err)
+	}
+
+	for _, want := range []string{
+		"当前 AI 服务调用失败",
+		"账号被禁用/封禁",
+		"USER_IS_BANNED",
+		"换一个可用账号/API Key",
+		"切换到另一个已启用模型",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("expected message to contain %q, got: %s", want, msg)
+		}
+	}
+	for _, unexpected := range []string{"余额不足", "超时"} {
+		if strings.Contains(msg, unexpected) {
+			t.Fatalf("banned account auth failure should not mention %q: %s", unexpected, msg)
+		}
+	}
+}
+
 func TestCompletedPlanFallbackDoesNotExposeFinalSummaryFailure(t *testing.T) {
 	msg := formatCompletedPlanFallback("zh", []PlanStep{
 		{

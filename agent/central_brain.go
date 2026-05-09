@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"nofx/mcp"
+	"nofx/store"
 )
 
 // brainDecision is the routing contract between the first-pass LLM and the executor.
@@ -110,7 +111,7 @@ func buildBrainUserPrompt(lang, text, previousAssistantReply, recentHistory, cur
 	sb.WriteString("\n\n")
 	sb.WriteString("=== MANAGEMENT DOMAIN PRIMER ===\n")
 	if hasActive {
-		sb.WriteString(defaultIfEmpty(buildSkillDomainPrimer(lang, activeSession.SkillName), "none"))
+		sb.WriteString(defaultIfEmpty(buildSkillDomainPrimerForSession(lang, activeToLegacySkillSession(activeSession)), "none"))
 	} else {
 		sb.WriteString(defaultIfEmpty(buildManagementDomainPrimer(lang), "none"))
 	}
@@ -247,6 +248,7 @@ func (a *Agent) executeBrainDecision(ctx context.Context, storeUserID string, us
 		session := newActiveSkillSession(userID, skill, action)
 		session.Goal = strings.TrimSpace(text)
 		d.ExtractedData = filterExtractedDataForActiveSession(session, d.ExtractedData, lang)
+		markStrategyCreateConfigProgressThisTurn(&session, d.ExtractedData)
 		mergeExtractedData(&session, d.ExtractedData)
 		return a.driveActiveSession(ctx, storeUserID, userID, lang, text, session, onEvent)
 
@@ -255,6 +257,7 @@ func (a *Agent) executeBrainDecision(ctx context.Context, storeUserID string, us
 			return "", false, nil
 		}
 		d.ExtractedData = filterExtractedDataForActiveSession(activeSession, d.ExtractedData, lang)
+		markStrategyCreateConfigProgressThisTurn(&activeSession, d.ExtractedData)
 		mergeExtractedData(&activeSession, d.ExtractedData)
 		return a.driveActiveSession(ctx, storeUserID, userID, lang, text, activeSession, onEvent)
 
@@ -271,7 +274,12 @@ func (a *Agent) driveActiveSession(ctx context.Context, storeUserID string, user
 	if !ok {
 		stepDecision = activeSessionStepDecision{}
 	}
+	configProgressThisTurn := consumeStrategyCreateConfigProgressThisTurn(&session)
+	if strategyCreateDecisionHasConfigProgress(session, stepDecision.ExtractedData) {
+		configProgressThisTurn = true
+	}
 	mergeExtractedData(&session, stepDecision.ExtractedData)
+	maybeForceStrategyCreateExecutionOnConfirmation(lang, text, &session, &stepDecision)
 
 	if stepDecision.Route == "" {
 		if len(missingRequiredFields(session)) > 0 {
@@ -301,6 +309,14 @@ func (a *Agent) driveActiveSession(ctx context.Context, storeUserID string, user
 			a.recordSkillInteraction(userID, text, guarded)
 			return guarded, true, nil
 		}
+		if guarded, blocked := guardUnsupportedAsyncPromise(lang, reply); blocked {
+			session = appendActiveSessionLocalHistory(session, "assistant", guarded)
+			setActiveSessionPendingHint(&session, guarded)
+			a.saveActiveSkillSession(session)
+			emitBrainReply(onEvent, guarded)
+			a.recordSkillInteraction(userID, text, guarded)
+			return guarded, true, nil
+		}
 		a.clearActiveSkillSession(userID)
 		if reply == "" {
 			return "", false, nil
@@ -310,9 +326,24 @@ func (a *Agent) driveActiveSession(ctx context.Context, storeUserID string, user
 		return reply, true, nil
 
 	case "ask_user":
-		reply := strings.TrimSpace(stepDecision.Reply)
+		reply := ""
+		if guarded, blocked := guardStrategyCreateBeforeFinalConfirmation(lang, session); blocked {
+			session.CollectedFields["awaiting_final_confirmation"] = true
+			reply = guarded
+		}
+		if reply == "" && configProgressThisTurn {
+			if deterministic, ok := strategyCreateTemplateMissingReply(lang, text, session); ok {
+				reply = deterministic
+			}
+		}
 		if reply == "" {
-			reply = a.askForMissingFields(lang, session)
+			reply = strings.TrimSpace(stepDecision.Reply)
+			if reply == "" {
+				reply = a.askForMissingFields(lang, session)
+			}
+		}
+		if guarded, blocked := guardStrategyCreateAINonTemplateQuestion(lang, session, reply); blocked {
+			reply = guarded
 		}
 		if guarded, blocked := guardUnsupportedAsyncPromise(lang, reply); blocked {
 			reply = guarded
@@ -333,7 +364,11 @@ func (a *Agent) driveActiveSession(ctx context.Context, storeUserID string, user
 		var canExecute bool
 		session, repairReply, canExecute = a.ensureStrategyCreateExecutableState(ctx, lang, text, session)
 		if !canExecute {
-			repairReply = defaultIfEmpty(repairReply, a.askForMissingFields(lang, session))
+			if strategyCreateLooseConfirmationReply(text) {
+				repairReply = a.askForMissingFields(lang, session)
+			} else {
+				repairReply = defaultIfEmpty(repairReply, a.askForMissingFields(lang, session))
+			}
 			session = appendActiveSessionLocalHistory(session, "assistant", repairReply)
 			setActiveSessionPendingHint(&session, repairReply)
 			a.saveActiveSkillSession(session)
@@ -341,14 +376,16 @@ func (a *Agent) driveActiveSession(ctx context.Context, storeUserID string, user
 			a.recordSkillInteraction(userID, text, repairReply)
 			return repairReply, true, nil
 		}
-		if guarded, blocked := guardStrategyCreateBeforeFinalConfirmation(lang, session); blocked {
-			session.CollectedFields["awaiting_final_confirmation"] = true
-			session = appendActiveSessionLocalHistory(session, "assistant", guarded)
-			setActiveSessionPendingHint(&session, guarded)
-			a.saveActiveSkillSession(session)
-			emitBrainReply(onEvent, guarded)
-			a.recordSkillInteraction(userID, text, guarded)
-			return guarded, true, nil
+		if !strategyCreateLooseConfirmationReply(text) {
+			if guarded, blocked := guardStrategyCreateBeforeFinalConfirmation(lang, session); blocked {
+				session.CollectedFields["awaiting_final_confirmation"] = true
+				session = appendActiveSessionLocalHistory(session, "assistant", guarded)
+				setActiveSessionPendingHint(&session, guarded)
+				a.saveActiveSkillSession(session)
+				emitBrainReply(onEvent, guarded)
+				a.recordSkillInteraction(userID, text, guarded)
+				return guarded, true, nil
+			}
 		}
 		outcome, nextSession, pending, ok := a.executeActiveSkillSession(storeUserID, userID, lang, text, session)
 		if !ok {
@@ -402,6 +439,16 @@ func (a *Agent) driveActiveSession(ctx context.Context, storeUserID string, user
 	}
 }
 
+func strategyCreateLooseConfirmationReply(text string) bool {
+	if strategyCreateConfirmationReply(text) {
+		return true
+	}
+	lower := strings.ToLower(strings.TrimSpace(text))
+	return strings.Contains(lower, "确认创建") ||
+		strings.Contains(lower, "按这个创建") ||
+		strings.Contains(lower, "confirm create")
+}
+
 func (a *Agent) ensureStrategyCreateExecutableState(ctx context.Context, lang, text string, session ActiveSkillSession) (ActiveSkillSession, string, bool) {
 	if session.SkillName != "strategy_management" || session.ActionName != "create" {
 		return session, "", true
@@ -425,13 +472,18 @@ Return JSON only.
 
 Rules:
 - Think from the current user message, previous assistant proposal, and active history.
-- If concrete strategy settings can be determined, write them into extracted_data.config_patch as a StrategyConfig-shaped JSON patch.
 - If the previous assistant already asked the user to confirm a concrete creation proposal in chat and the current user confirms it, set extracted_data.awaiting_final_confirmation=true too.
-- For strategy creation, after the initial strategy type is known, do not ask field-by-field. Propose one complete draft using user-provided values plus safe defaults for anything still unspecified.
-- If the user is asking you to design settings but has not confirmed creation yet, use route ask_user, provide a concise chat confirmation reply, and include the designed config in extracted_data.config_patch plus extracted_data.awaiting_final_confirmation=true.
+- For each user message, decide how it relates to the currently selected strategy product template.
+- If the message provides explicit values, corrections, preferences, constraints, or asks you to recommend/design, translate only the determinable template fields into extracted_data.config_patch as a StrategyConfig-shaped JSON patch.
+- If the message is only a question, explanation request, greeting, or unrelated text, answer it without inventing config_patch.
+- Do not silently fill missing fields when the user has not authorized it. But if the user explicitly says things like "你帮我定 / 你推荐 / 按稳健高频设计 / 其他你定", that is authorization for the Agent to design the remaining fields. In that case you must produce a recommended config_patch based on the current strategy template and field limits, and explain which values came from the user versus which values are Agent recommendations.
+- The product editor template is the source of truth. Use only fields from the selected product template.
+- If the user switches strategy type, set extracted_data.strategy_type to the new type and discard fields from the previous type. Keep only shared fields such as name/description/publish settings.
+- In NOFXi product schema, AI500/OI Top/OI Low/static coin-source requests are ai_trading, not grid_trading.
 - Strategy creation is chat-executable. Do not tell the user to click a web/app button, open a page, or manually create it elsewhere.
-- Do not claim the strategy was created. This step only repairs state or asks for more information.
-- If there is not enough information to determine a config, ask one natural follow-up question.
+- Do not claim the strategy was created and do not promise future execution ("马上创建", "正在创建", "稍后通知"). This step only repairs state or asks for missing information.
+- When the current user message is a confirmation, prefer route="ready" whenever the structured template can be repaired. If it cannot be repaired, route="ask_user" with only the missing fields; never reply that you are about to create it.
+- If the template is still incomplete after applying determinable config_patch, ask one natural follow-up question or explain the missing fields.
 
 Return shape:
 {"route":"ready|ask_user","reply":"","extracted_data":{}}`)
@@ -507,6 +559,75 @@ func strategyCreateSessionReady(lang string, session ActiveSkillSession) bool {
 	return ready
 }
 
+func strategyCreateDecisionHasConfigProgress(session ActiveSkillSession, data map[string]any) bool {
+	if session.SkillName != "strategy_management" || session.ActionName != "create" || len(data) == 0 {
+		return false
+	}
+	patch, ok := data[strategyCreateConfigPatchField]
+	if !ok {
+		return false
+	}
+	sanitized := sanitizeStrategyCreateConfigPatchForType(patch, defaultIfEmpty(strategyTypeFromExtractedData(data), strategyTypeFromCollectedFields(session.CollectedFields)))
+	return len(sanitized) > 0
+}
+
+const strategyCreateConfigProgressThisTurnField = "__strategy_create_config_progress_this_turn"
+
+func markStrategyCreateConfigProgressThisTurn(session *ActiveSkillSession, data map[string]any) {
+	if session == nil || !strategyCreateDecisionHasConfigProgress(*session, data) {
+		return
+	}
+	if session.CollectedFields == nil {
+		session.CollectedFields = map[string]any{}
+	}
+	session.CollectedFields[strategyCreateConfigProgressThisTurnField] = true
+}
+
+func consumeStrategyCreateConfigProgressThisTurn(session *ActiveSkillSession) bool {
+	if session == nil || session.CollectedFields == nil {
+		return false
+	}
+	progress := activeFieldBool(session.CollectedFields[strategyCreateConfigProgressThisTurnField])
+	delete(session.CollectedFields, strategyCreateConfigProgressThisTurnField)
+	return progress
+}
+
+func maybeForceStrategyCreateExecutionOnConfirmation(lang, text string, session *ActiveSkillSession, decision *activeSessionStepDecision) bool {
+	if session == nil || decision == nil {
+		return false
+	}
+	if session.SkillName != "strategy_management" || session.ActionName != "create" {
+		return false
+	}
+	if !strategyCreateLooseConfirmationReply(text) {
+		return false
+	}
+	if !strategyCreateSessionReady(lang, *session) {
+		return false
+	}
+	if session.CollectedFields == nil {
+		session.CollectedFields = map[string]any{}
+	}
+	session.CollectedFields["awaiting_final_confirmation"] = true
+	decision.Route = "execute_skill"
+	decision.Reply = ""
+	return true
+}
+
+func (a *Agent) activeStrategyCreateSession(userID int64) (ActiveSkillSession, bool) {
+	if session, ok := a.getActiveSkillSession(userID); ok && session.SkillName == "strategy_management" && session.ActionName == "create" {
+		return session, true
+	}
+	if legacy := a.getSkillSession(userID); legacy.Name == "strategy_management" && legacy.Action == "create" {
+		return activeSessionFromLegacy(ActiveSkillSession{
+			UserID:     userID,
+			SkillName:  "strategy_management",
+			ActionName: "create",
+		}, legacy), true
+	}
+	return ActiveSkillSession{}, false
+}
+
 func guardStrategyCreateBeforeFinalConfirmation(lang string, session ActiveSkillSession) (string, bool) {
 	if session.SkillName != "strategy_management" || session.ActionName != "create" {
 		return "", false
@@ -525,6 +646,25 @@ func guardStrategyCreateBeforeFinalConfirmation(lang string, session ActiveSkill
 	return formatStrategyCreateFinalConfirmation(lang, legacy, cfg), true
 }
 
+func strategyCreateTemplateMissingReply(lang, text string, session ActiveSkillSession) (string, bool) {
+	if session.SkillName != "strategy_management" || session.ActionName != "create" {
+		return "", false
+	}
+	legacy := activeToLegacySkillSession(session)
+	cfg, _, _, err := strategyCreateConfigFromSession(legacy, lang)
+	if err != nil {
+		return "", false
+	}
+	ready, missingKind := strategyCreateConfigReady(legacy, cfg, "")
+	if ready || strings.TrimSpace(missingKind) == "" {
+		return "", false
+	}
+	if reply := formatStrategyCreateFieldOptionsReply(lang, text, missingKind); reply != "" {
+		return reply, true
+	}
+	return formatStrategyCreateConfigNeeded(lang, missingKind), true
+}
+
 func strategyCreateHasPriorConfirmationPrompt(session ActiveSkillSession) bool {
 	for i := len(session.LocalHistory) - 1; i >= 0; i-- {
 		msg := session.LocalHistory[i]
@@ -539,6 +679,9 @@ func strategyCreateHasPriorConfirmationPrompt(session ActiveSkillSession) bool {
 		return strings.Contains(content, "确认创建") ||
 			strings.Contains(content, "确认后我再创建") ||
 			strings.Contains(content, "配置整理好了") ||
+			strings.Contains(content, "请确认是否按以上设置创建") ||
+			strings.Contains(content, "如果没问题，我就执行创建") ||
+			strings.Contains(content, "是否按以上设置创建") ||
 			strings.Contains(lower, "confirm") ||
 			strings.Contains(lower, "create it")
 	}
@@ -569,6 +712,39 @@ func guardUnexecutedActiveTaskCompletion(lang string, session ActiveSkillSession
 	return "It has not actually been executed yet. The previous step only prepared or confirmed the draft; I need to run the structured tool before claiming completion.", true
 }
 
+func guardStrategyCreateAINonTemplateQuestion(lang string, session ActiveSkillSession, reply string) (string, bool) {
+	if session.SkillName != "strategy_management" || session.ActionName != "create" {
+		return "", false
+	}
+	if strategyTypeFromCollectedFields(session.CollectedFields) != "ai_trading" {
+		return "", false
+	}
+	lower := strings.ToLower(strings.TrimSpace(reply))
+	if lower == "" {
+		return "", false
+	}
+	if !containsAny(lower, []string{
+		"投入多少", "投入资金", "总投入", "固定投入", "每笔交易", "每笔固定", "100u", "500u", "1000u",
+		"止损", "日亏损", "最大回撤",
+		"investment amount", "capital", "fixed amount", "per-trade", "stop loss", "daily loss", "max drawdown",
+	}) {
+		return "", false
+	}
+	legacy := activeToLegacySkillSession(session)
+	cfg, _, _, err := strategyCreateConfigFromSession(legacy, lang)
+	if err != nil {
+		return "", false
+	}
+	_, missingKind := strategyCreateConfigReady(legacy, cfg, "")
+	if strings.TrimSpace(missingKind) == "" {
+		return "", false
+	}
+	if lang == "zh" {
+		return "这些不是 AI 策略创建模板里的字段。我会继续按 AI 策略模板填写；当前还需要围绕选币来源、周期、杠杆、置信度、盈亏比、交易频率和开仓标准来确定配置。你也可以直接说“全部你定，按稳健/高频/激进”。", true
+	}
+	return "Those are not fields in the AI strategy creation template. I will continue using the AI strategy template: coin source, timeframes, leverage, confidence, risk/reward, trading frequency, and entry standards.", true
+}
+
 func guardUnsupportedAsyncPromise(lang, reply string) (string, bool) {
 	lower := strings.ToLower(strings.TrimSpace(reply))
 	if lower == "" {
@@ -587,7 +763,7 @@ func guardUnsupportedAsyncPromise(lang, reply string) (string, bool) {
 		return "", false
 	}
 	if lang == "zh" {
-		return "我需要纠正一下：我没有后台异步任务在运行，也不会稍后自动推送结果。诊断/创建/修改/启动这类任务必须在当前回复里实际执行并给出真实结果；如果还不能执行，我应该直接说明缺少哪个对象、时间范围或数据。", true
+		return "我需要纠正一下：我没有后台异步任务在运行，也不会自动推送后续结果。诊断/创建/修改/启动这类任务必须在当前回复里实际执行并给出真实结果；如果还不能执行，我应该直接说明缺少哪个对象、时间范围或数据。", true
 	}
 	return "I need to correct that: there is no background task running, and I will not automatically push a later result. Diagnosis/create/update/start tasks must actually execute and return a real result in the current response; if execution is not possible, I should state which target, range, or data is missing.", true
 }
@@ -633,7 +809,8 @@ func (a *Agent) planActiveSessionStep(ctx context.Context, storeUserID string, u
 	}
 	previousAssistantReply := a.currentPendingHintText(userID)
 
-	domainPrimer := buildSkillDomainPrimer(lang, session.SkillName)
+	domainPrimer := buildSkillDomainPrimerForSession(lang, legacy)
+	specificRules := activeSessionSpecificRules(legacy)
 
 	systemPrompt := prependNOFXiAdvisorPreamble(fmt.Sprintf(`You are the active-task orchestration loop for NOFXi.
 You decide the NEXT step for exactly one active task. Return JSON only.
@@ -664,15 +841,7 @@ Rules:
 - Use contextual memory from the active task history and current references.
 - Prefer "execute_skill" when the user has already given enough information to act.
 - Prefer "ask_user" only when something truly necessary is still missing.
-- For strategy_management:create, the only normal first fork is strategy type: AI strategy or grid strategy. After that, do not collect fields one by one; produce a complete recommended draft from user-provided values plus safe defaults, then ask the user to confirm or change any item.
-- For strategy_management:create/update_config: every turn, reason about whether any config fields can now be determined from the user's message and conversation history. If yes, write them into extracted_data.config_patch.
-- For strategy_management:create: when the user asks you to design/recommend settings, think as the strategy designer, produce a concrete recommended config in your reply, and also put the same structured config into extracted_data.config_patch. Do not ask the user to fill fields you can reasonably choose for them.
-- For strategy_management:create: clearly distinguish user-provided fields from your recommended/defaulted fields. Never say a value is "already filled", "user provided", or "already configured" unless it appears in Current collected fields or the current user message. For values you choose, say "我建议/我先按安全默认值".
-- For strategy_management:create grid_trading: never infer "current BTC/ETH/SOL price" or explicit upper/lower grid bounds from memory. If no fresh market tool observation is present, recommend ATR auto bounds instead and set grid_config.use_atr_bounds=true with upper_price/lower_price omitted or 0. Only recommend numeric upper_price/lower_price as "based on current price" when the price was actually fetched in this task.
-- For strategy_management:create: once the structured config is sufficient to create, ask for one chat confirmation reply (for example, "回复“确认创建”") and set extracted_data.awaiting_final_confirmation=true. Do not execute create in that same turn.
-- For strategy_management:create: choose execute_skill only when awaiting_final_confirmation is already true and the current user message confirms the chat summary. If the user changes a number, update config_patch and ask for chat confirmation again.
-- For strategy_management:create: the confirmation happens in chat. Never tell the user to click a web/app button, find a page button, or manually create it elsewhere.
-- For strategy_management:create: if the previous assistant reply said the strategy was not actually created yet and that the next step is to call the structured create tool, then a user request to continue/proceed means execute the current skill when the structured config is ready. Do not answer with another promise such as "I will create it now"; choose execute_skill.
+%s
 - For any mutating task, a reply that only promises future execution ("now I will create/update/start it", "result soon") is not a valid finish_task or ask_user outcome. If execution is the next step, choose execute_skill.
 - For diagnosis, create, update, delete, start, stop, query/history, and performance-analysis tasks, never answer with only "马上处理 / 请稍等 / 诊断中 / I'll tell you later". NOFXi has no background chat job that will later push an answer. Choose execute_skill/planned_agent when enough information exists; otherwise ask for the missing target/range/data.
 - Never choose finish_task for an unfinished mutating active task by claiming it was created/updated/deleted/started/stopped. Only a real skill/tool execution outcome can support that claim.
@@ -684,9 +853,6 @@ Rules:
 - If the user refers to a specific object from disclosed targets, set target_ref_id and target_ref_name when you can resolve it.
 - Current references are context for reasoning only. Do not copy a current reference into target_ref_id/target_ref_name unless the user explicitly refers to that object by name/id or clearly says "this/current/that previous one". If the target is not clear, ask instead of executing.
 - For trader bindings, exchange/model/strategy must resolve to an ID from Relevant disclosed resources before execution. Never invent a resource name or use a generic venue type like Binance/OKX as the bound exchange unless it appears as an actual disclosed resource.
-- For strategy_management:create, do not ask for exchange accounts or model bindings. Strategy templates are independent drafts/configs; exchange/model are only needed when creating, deploying, or starting a trader.
-- Strategy templates should be visible in the strategy list/page after creation. Do not bring up trader/model/exchange binding unless the user asks to run or deploy.
-- For strategy_management:create or strategy_management:update_config, when the user describes strategy intent, output config_patch as a partial StrategyConfig JSON object instead of leaving the default template unchanged. The product schema is type-isolated: grid strategies use only top-level strategy_type + grid_config + publish_config; AI strategies use only top-level strategy_type + ai_config + publish_config. For example, "BTC趋势做空" as an AI strategy should set ai_config.coin_source to static BTCUSDT and add ai_config prompt/risk/entry rules.
 - If there are multiple targets and the user did not disambiguate, ask a natural question with the available names.
 - If the current user message answers a missing field directly, extract it and continue.
 - extracted_data must use only canonical keys from Allowed field spec JSON. Never output aliases, translated labels, or raw user wording as keys.
@@ -704,6 +870,7 @@ Return JSON with this exact shape:
 		defaultIfEmpty(string(resourcesJSON), "{}"),
 		defaultIfEmpty(string(fieldSpecsJSON), "[]"),
 		defaultIfEmpty(domainPrimer, "(none)"),
+		specificRules,
 	))
 	userPrompt := fmt.Sprintf("Language: %s\nCurrent user message: %s\n\nPrevious assistant reply:\n%s\n\nActive task local history:\n%s\n", lang, text, defaultIfEmpty(previousAssistantReply, "(empty)"), localHistory)
 
@@ -726,6 +893,29 @@ Return JSON with this exact shape:
 	}
 	decision.ExtractedData = filterExtractedDataForActiveSession(session, decision.ExtractedData, lang)
 	return decision, true
+}
+
+func activeSessionSpecificRules(session skillSession) string {
+	if session.Name != "strategy_management" {
+		return ""
+	}
+	switch session.Action {
+	case "create", "update_config":
+		return strings.Join([]string{
+			"- For strategy_management:create/update_config, the selected product editor template is the only schema. Write values only through extracted_data.config_patch, using the current type branch only: ai_trading => strategy_type + ai_config + publish_config; grid_trading => strategy_type + grid_config + publish_config.",
+			"- For strategy_management:create/update_config, config_patch values must be product schema raw values, not user-facing labels. Examples: source_type=\"ai500\" not \"AI500\"; strategy_type=\"ai_trading\" not \"AI 策略\"; selected_timeframes=[\"1m\",\"5m\",\"15m\"] not a JSON string.",
+			"- For strategy_management:create, AI500/OI Top/OI Low/static coin-source requests imply strategy_type=\"ai_trading\". Do not leave strategy type ambiguous in that case.",
+			"- For strategy_management:create/update_config, judge the user's natural-language intent. Explicit values, corrections, constraints, preferences, or requests to recommend/design must become config_patch for every determinable current-template field; pure questions/greetings/acknowledgements must not invent config_patch.",
+			"- For strategy_management:create, the Relevant disclosed resources include product_default_template and current_missing_template_fields. Treat product_default_template as the product editor's default template and field shape.",
+			"- For strategy_management:create, do not ask for or present fields listed in product_default_template.non_fields. They are not part of the selected product editor template.",
+			"- For strategy_management:create, when the user states a strategy style/preference or authorizes the Agent to recommend/design remaining settings, use product_default_template as the base, adjust it to the user's stated preference, and output config_patch that fills every determinable missing template field. Do not ask the user to restate fields that can be responsibly selected from the default template.",
+			"- For grid_trading create, if the user authorizes the Agent to choose/recommend remaining settings, set grid_config.use_atr_bounds=true for the price range unless the user explicitly gives manual upper_price/lower_price. Never invent current market prices or say a symbol is currently near a price without a fresh market-data tool result.",
+			"- For strategy_management:create, any user-facing strategy plan must be generated from the post-merge structured config built from config_patch and the current strategy type. Do not display fields that would be filtered out or belong to the other strategy type.",
+			"- For strategy_management:create, once complete, ask for one chat confirmation with awaiting_final_confirmation=true; after confirmation execute synchronously with empty reply and only report success after the tool returns.",
+		}, "\n")
+	default:
+		return ""
+	}
 }
 
 func (a *Agent) executeActiveSkillSession(storeUserID string, userID int64, lang, text string, session ActiveSkillSession) (skillOutcome, ActiveSkillSession, bool, bool) {
@@ -840,13 +1030,16 @@ func activeToLegacySkillSession(s ActiveSkillSession) skillSession {
 			legacy.Fields[k] = str
 		}
 	}
-	if s.SkillName == "strategy_management" && s.ActionName == "create" {
-		draft := buildStrategyDraftFromActiveSession(s)
-		if legacy.Fields["name"] == "" && strings.TrimSpace(draft.Name) != "" {
-			legacy.Fields["name"] = strings.TrimSpace(draft.Name)
-		}
-		if draftRaw := marshalStrategyDraft(draft); draftRaw != "{}" {
-			legacy.Fields[strategyCreateDraftIntentField] = draftRaw
+	if s.SkillName == "strategy_management" && s.ActionName == "create" && legacy.Fields["name"] == "" {
+		for i := len(s.LocalHistory) - 1; i > 0; i-- {
+			msg := s.LocalHistory[i]
+			if msg.Role != "user" || !activeHistoryMessageAsksStrategyName(s.LocalHistory[i-1].Content) {
+				continue
+			}
+			if inferred := inferStandaloneStrategyName(msg.Content); inferred != "" {
+				legacy.Fields["name"] = inferred
+				break
+			}
 		}
 	}
 	return legacy
@@ -913,15 +1106,107 @@ func (a *Agent) buildActiveSessionResources(storeUserID string, session skillSes
 	case "strategy_management":
 		resources := a.buildSimpleEntityConversationResources(storeUserID, session, a.loadStrategyOptions(storeUserID))
 		if strategyType := explicitStrategyCreateType(session); strategyType != "" {
+			lang := defaultIfEmpty(a.config.Language, "zh")
 			resources["current_strategy_type"] = strategyType
 			resources["current_editable_fields"] = manualStrategyEditableFieldKeysForType(strategyType)
+			if session.Action == "create" || session.Action == "update_config" {
+				resources["product_default_template"] = strategyProductDefaultTemplateResource(lang, strategyType)
+				if cfg, _, _, err := strategyCreateConfigFromSession(session, lang); err == nil {
+					resources["current_missing_template_fields"] = strategyCreateMissingTemplateFields(session, cfg)
+				}
+			}
 		} else if strategyType, ok := a.strategyTypeForTarget(storeUserID, session.TargetRef); ok {
+			lang := defaultIfEmpty(a.config.Language, "zh")
 			resources["target_strategy_type"] = strategyType
 			resources["target_editable_fields"] = manualStrategyEditableFieldKeysForType(strategyType)
+			resources["product_default_template"] = strategyProductDefaultTemplateResource(lang, strategyType)
 		}
 		return resources
 	default:
 		return nil
+	}
+}
+
+func strategyProductDefaultTemplateResource(lang, strategyType string) map[string]any {
+	cfg := store.GetDefaultStrategyConfig(defaultIfEmpty(lang, "zh"))
+	cfg.StrategyType = strings.TrimSpace(strategyType)
+	cfg.ClampLimits()
+	publish := map[string]any{
+		"is_public":      false,
+		"config_visible": true,
+	}
+	switch cfg.StrategyType {
+	case "grid_trading":
+		grid := cfg.GridConfig
+		if grid == nil {
+			defaultGrid := store.DefaultGridStrategyConfig()
+			grid = &defaultGrid
+		}
+		return map[string]any{
+			"strategy_type":   "grid_trading",
+			"grid_config":     grid,
+			"publish_config":  publish,
+			"required_fields": strategyCreateMissingGridFields(skillSession{}),
+		}
+	default:
+		return map[string]any{
+			"strategy_type": "ai_trading",
+			"ai_config": map[string]any{
+				"coin_source": map[string]any{
+					"source_type":    cfg.CoinSource.SourceType,
+					"static_coins":   cfg.CoinSource.StaticCoins,
+					"excluded_coins": cfg.CoinSource.ExcludedCoins,
+					"ai500_limit":    cfg.CoinSource.AI500Limit,
+					"oi_top_limit":   cfg.CoinSource.OITopLimit,
+					"oi_low_limit":   cfg.CoinSource.OILowLimit,
+				},
+				"indicators": map[string]any{
+					"klines": map[string]any{
+						"primary_timeframe":   cfg.Indicators.Klines.PrimaryTimeframe,
+						"primary_count":       cfg.Indicators.Klines.PrimaryCount,
+						"selected_timeframes": cfg.Indicators.Klines.SelectedTimeframes,
+					},
+					"enable_ema":          cfg.Indicators.EnableEMA,
+					"enable_macd":         cfg.Indicators.EnableMACD,
+					"enable_rsi":          cfg.Indicators.EnableRSI,
+					"enable_atr":          cfg.Indicators.EnableATR,
+					"enable_boll":         cfg.Indicators.EnableBOLL,
+					"enable_volume":       cfg.Indicators.EnableVolume,
+					"enable_oi":           cfg.Indicators.EnableOI,
+					"enable_funding_rate": cfg.Indicators.EnableFundingRate,
+				},
+				"risk_control": map[string]any{
+					"btc_eth_max_leverage":  cfg.RiskControl.BTCETHMaxLeverage,
+					"altcoin_max_leverage":  cfg.RiskControl.AltcoinMaxLeverage,
+					"min_confidence":        cfg.RiskControl.MinConfidence,
+					"min_risk_reward_ratio": cfg.RiskControl.MinRiskRewardRatio,
+				},
+				"prompt_sections": map[string]any{
+					"trading_frequency": cfg.PromptSections.TradingFrequency,
+					"entry_standards":   cfg.PromptSections.EntryStandards,
+				},
+				"custom_prompt": cfg.CustomPrompt,
+			},
+			"publish_config": publish,
+			"non_fields": []string{
+				"investment_amount",
+				"fixed_position_size",
+				"stop_loss_pct",
+				"daily_loss_limit_pct",
+				"max_drawdown_pct",
+			},
+			"required_fields": []string{
+				"source_type",
+				"primary_timeframe",
+				"selected_timeframes",
+				"btceth_max_leverage",
+				"altcoin_max_leverage",
+				"min_confidence",
+				"min_risk_reward_ratio",
+				"trading_frequency",
+				"entry_standards",
+			},
+		}
 	}
 }
 
@@ -992,6 +1277,14 @@ func mergeExtractedData(s *ActiveSkillSession, data map[string]any) {
 	if s.CollectedFields == nil {
 		s.CollectedFields = map[string]any{}
 	}
+	if s.SkillName == "strategy_management" && s.ActionName == "create" {
+		if incomingType := strategyTypeFromExtractedData(data); incomingType != "" {
+			currentType := strategyTypeFromCollectedFields(s.CollectedFields)
+			if currentType != "" && currentType != incomingType {
+				resetActiveStrategyCreateFieldsForType(s, incomingType)
+			}
+		}
+	}
 	for k, v := range data {
 		k = strings.TrimSpace(k)
 		if k == "" {
@@ -1027,10 +1320,164 @@ func filterExtractedDataForActiveSession(session ActiveSkillSession, data map[st
 		}
 		out[key] = value
 	}
+	if session.SkillName == "strategy_management" && session.ActionName == "create" {
+		out = filterStrategyCreateExtractedDataByTemplate(session, out)
+	}
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+func strategyTypeFromExtractedData(data map[string]any) string {
+	if len(data) == 0 {
+		return ""
+	}
+	if value, ok := data["strategy_type"]; ok {
+		if strategyType := parseStrategyTypeValue(fmt.Sprint(value)); strategyType != "" {
+			return strategyType
+		}
+	}
+	if patch, ok := data[strategyCreateConfigPatchField]; ok {
+		if strategyType := strategyTypeFromConfigPatchAny(patch); strategyType != "" {
+			return strategyType
+		}
+	}
+	return ""
+}
+
+func strategyTypeFromCollectedFields(fields map[string]any) string {
+	if len(fields) == 0 {
+		return ""
+	}
+	if value, ok := fields["strategy_type"]; ok {
+		if strategyType := parseStrategyTypeValue(fmt.Sprint(value)); strategyType != "" {
+			return strategyType
+		}
+	}
+	if patch, ok := fields[strategyCreateConfigPatchField]; ok {
+		if strategyType := strategyTypeFromConfigPatchAny(patch); strategyType != "" {
+			return strategyType
+		}
+	}
+	return ""
+}
+
+func strategyTypeFromConfigPatchAny(value any) string {
+	patch := mapFromAny(value)
+	if len(patch) == 0 {
+		return ""
+	}
+	if strategyType := parseStrategyTypeValue(fmt.Sprint(patch["strategy_type"])); strategyType != "" {
+		return strategyType
+	}
+	if _, ok := patch["grid_config"]; ok {
+		return "grid_trading"
+	}
+	if _, ok := patch["ai_config"]; ok {
+		return "ai_trading"
+	}
+	return ""
+}
+
+func resetActiveStrategyCreateFieldsForType(s *ActiveSkillSession, strategyType string) {
+	if s.CollectedFields == nil {
+		s.CollectedFields = map[string]any{}
+	}
+	keep := map[string]any{}
+	for _, key := range []string{"name", "description", "is_public", "config_visible", "lang"} {
+		if value, ok := s.CollectedFields[key]; ok {
+			keep[key] = value
+		}
+	}
+	keep["strategy_type"] = strategyType
+	s.CollectedFields = keep
+}
+
+func filterStrategyCreateExtractedDataByTemplate(session ActiveSkillSession, data map[string]any) map[string]any {
+	if len(data) == 0 {
+		return data
+	}
+	strategyType := strategyTypeFromExtractedData(data)
+	if strategyType == "" {
+		strategyType = strategyTypeFromCollectedFields(session.CollectedFields)
+	}
+	if strategyType == "" {
+		return data
+	}
+	allowed := map[string]struct{}{}
+	for _, key := range manualStrategyEditableFieldKeysForType(strategyType) {
+		allowed[key] = struct{}{}
+	}
+	out := make(map[string]any, len(data))
+	for key, value := range data {
+		if key == strategyCreateConfigPatchField {
+			if patch := sanitizeStrategyCreateConfigPatchForType(value, strategyType); len(patch) > 0 {
+				out[key] = patch
+			}
+			continue
+		}
+		if key == "awaiting_final_confirmation" {
+			out[key] = value
+			continue
+		}
+		if _, ok := allowed[key]; ok {
+			out[key] = value
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func sanitizeStrategyCreateConfigPatchForType(value any, strategyType string) map[string]any {
+	patch := mapFromAny(value)
+	if len(patch) == 0 {
+		return nil
+	}
+	out := map[string]any{
+		"strategy_type": strategyType,
+	}
+	if publish := mapFromAny(patch["publish_config"]); len(publish) > 0 {
+		out["publish_config"] = publish
+	}
+	switch strategyType {
+	case "grid_trading":
+		if grid := mapFromAny(patch["grid_config"]); len(grid) > 0 {
+			out["grid_config"] = grid
+		}
+	case "ai_trading":
+		ai := mapFromAny(patch["ai_config"])
+		if ai == nil {
+			ai = map[string]any{}
+		}
+		for _, key := range []string{"coin_source", "indicators", "risk_control", "prompt_sections", "custom_prompt"} {
+			if value, ok := patch[key]; ok {
+				ai[key] = value
+			}
+		}
+		if len(ai) > 0 {
+			out["ai_config"] = ai
+		}
+	}
+	if len(out) == 1 {
+		return nil
+	}
+	return out
+}
+
+func mapFromAny(value any) map[string]any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return typed
+	case string:
+		var out map[string]any
+		if err := json.Unmarshal([]byte(typed), &out); err == nil {
+			return out
+		}
+	}
+	return nil
 }
 
 func emitBrainReply(onEvent func(event, data string), reply string) {

@@ -570,9 +570,9 @@ func isEphemeralReadFastPathKind(kind string) bool {
 func (a *Agent) executeReadFastPath(storeUserID string, _ int64, req *readFastPathRequest) string {
 	switch req.Kind {
 	case "get_balance":
-		return a.toolGetBalance()
+		return a.toolGetBalance(storeUserID)
 	case "get_positions":
-		return a.toolGetPositions()
+		return a.toolGetPositions(storeUserID)
 	case "get_trade_history":
 		return a.toolGetTradeHistory(req.ArgsJSON)
 	case "get_strategies":
@@ -842,7 +842,7 @@ func (a *Agent) thinkAndAct(ctx context.Context, storeUserID string, userID int6
 		if answer, ok := a.tryHardSkill(ctx, storeUserID, userID, lang, text, nil); ok {
 			return a.maybeAppendResumePrompt(userID, lang, text, answer), nil
 		}
-		return a.noAIFallback(lang, text)
+		return a.noAIFallback(storeUserID, lang, text)
 	}
 	answer, err := a.runPlannedAgent(ctx, storeUserID, userID, lang, text, nil)
 	return a.maybeAppendResumePrompt(userID, lang, text, answer), err
@@ -877,7 +877,7 @@ func (a *Agent) thinkAndActStream(ctx context.Context, storeUserID string, userI
 		if answer, ok := a.tryHardSkill(ctx, storeUserID, userID, lang, text, onEvent); ok {
 			return a.maybeAppendResumePrompt(userID, lang, text, answer), nil
 		}
-		return a.noAIFallback(lang, text)
+		return a.noAIFallback(storeUserID, lang, text)
 	}
 	answer, err := a.runPlannedAgent(ctx, storeUserID, userID, lang, text, onEvent)
 	return a.maybeAppendResumePrompt(userID, lang, text, answer), err
@@ -933,12 +933,26 @@ func (a *Agent) tryStatePriorityPath(ctx context.Context, storeUserID string, us
 		}
 	}
 	if workflow := a.getWorkflowSession(userID); hasActiveWorkflowSession(workflow) {
+		if task, _, ok := nextRunnableWorkflowTask(workflow); ok && strings.TrimSpace(task.Skill) == "strategy_management" && strings.TrimSpace(task.Action) == "create" {
+			a.clearWorkflowSession(userID)
+			session := newActiveSkillSession(userID, "strategy_management", "create")
+			session.Goal = defaultIfEmpty(strings.TrimSpace(task.Request), strings.TrimSpace(text))
+			answer, handled, err := a.driveActiveSession(ctx, storeUserID, userID, lang, defaultIfEmpty(task.Request, text), session, onEvent)
+			return answer, handled, err
+		}
 		answer, handled, err := a.handleWorkflowSession(ctx, storeUserID, userID, lang, text, workflow, onEvent)
 		if handled || err != nil {
 			return answer, true, err
 		}
 	}
 	if session := a.getSkillSession(userID); strings.TrimSpace(session.Name) != "" {
+		if answer, ok := a.redirectModelCreateSessionToStrategyCreateIfNeeded(storeUserID, userID, lang, text, session); ok {
+			if onEvent != nil && strings.TrimSpace(answer) != "" {
+				onEvent(StreamEventTool, "hard_skill:strategy_management")
+				emitStreamText(onEvent, answer)
+			}
+			return answer, true, nil
+		}
 		decision, _ := a.resolveSkillSessionTurn(ctx, userID, lang, text, session)
 		switch decision.Intent {
 		case "cancel":
@@ -984,6 +998,9 @@ func (a *Agent) tryStatePriorityPath(ctx context.Context, storeUserID string, us
 			return answer, handled, err
 		default:
 			if decision.Intent == "continue_active" {
+				if answer, handled, err := a.redirectExecutionStateStrategyCreate(ctx, storeUserID, userID, lang, text, state, onEvent); handled || err != nil {
+					return answer, handled, err
+				}
 				if session, ok := a.bridgeExecutionStateToSkillSession(storeUserID, userID, text, state, extraction); ok {
 					answer, handled := a.dispatchBridgedSkillSession(storeUserID, userID, lang, text, session)
 					return answer, handled, nil
@@ -1129,6 +1146,9 @@ func (a *Agent) bridgeExecutionStateToSkillSession(storeUserID string, userID in
 	if a == nil || skillName == "" || action == "" || !hasSkillBridgeSignal(a, storeUserID, skillName, action, text, extraction) {
 		return skillSession{}, false
 	}
+	if skillName == "strategy_management" && action == "create" {
+		return skillSession{}, false
+	}
 
 	session := a.getSkillSession(userID)
 	if session.Name != "" && (session.Name != skillName || session.Action != action) {
@@ -1164,6 +1184,38 @@ func (a *Agent) bridgeExecutionStateToSkillSession(storeUserID string, userID in
 	a.saveSkillSession(userID, session)
 	a.clearExecutionState(userID)
 	return session, true
+}
+
+func (a *Agent) redirectExecutionStateStrategyCreate(ctx context.Context, storeUserID string, userID int64, lang, text string, state ExecutionState, onEvent func(event, data string)) (string, bool, error) {
+	skillName, action := inferExecutionStateSkillBridge(state, text)
+	if skillName != "strategy_management" || action != "create" {
+		return "", false, nil
+	}
+	a.clearExecutionState(userID)
+	session := newActiveSkillSession(userID, "strategy_management", "create")
+	session.Goal = defaultIfEmpty(strings.TrimSpace(state.Goal), strings.TrimSpace(text))
+	return a.driveActiveSession(ctx, storeUserID, userID, lang, text, session, onEvent)
+}
+
+func (a *Agent) redirectModelCreateSessionToStrategyCreateIfNeeded(storeUserID string, userID int64, lang, text string, session skillSession) (string, bool) {
+	if strings.TrimSpace(session.Name) != "model_management" || strings.TrimSpace(session.Action) != "create" {
+		return "", false
+	}
+	strategyType := parseStrategyTypeValue(text)
+	if strategyType == "" && !hasExplicitCreateIntentForDomain(text, "strategy") {
+		return "", false
+	}
+	strategySession := skillSession{
+		Name:   "strategy_management",
+		Action: "create",
+		Phase:  "collecting",
+		Fields: map[string]string{},
+	}
+	if strategyType != "" {
+		setStrategyCreateType(&strategySession, strategyType)
+	}
+	a.clearSkillSession(userID)
+	return a.handleStrategyCreateSkill(storeUserID, userID, lang, text, strategySession), true
 }
 
 func (a *Agent) dispatchBridgedSkillSession(storeUserID string, userID int64, lang, text string, session skillSession) (string, bool) {
@@ -1276,7 +1328,7 @@ func (a *Agent) handoffFromActiveFlow(ctx context.Context, storeUserID string, u
 		if answer, ok := a.tryHardSkill(ctx, storeUserID, userID, lang, text, onEvent); ok {
 			return a.maybeAppendResumePrompt(userID, lang, text, answer), true, nil
 		}
-		answer, err := a.noAIFallback(lang, text)
+		answer, err := a.noAIFallback(storeUserID, lang, text)
 		return a.maybeAppendResumePrompt(userID, lang, text, answer), true, err
 	}
 	answer, err := a.runPlannedAgent(ctx, storeUserID, userID, lang, text, onEvent)
@@ -1685,13 +1737,13 @@ func isSkillFlowDeflection(session skillSession, text string) bool {
 	}
 	switch strings.TrimSpace(session.Name) {
 	case "exchange_management":
-		return hasExplicitDiagnosisIntentForDomain(text, "model") || hasExplicitDiagnosisIntentForDomain(text, "trader") || hasExplicitDiagnosisIntentForDomain(text, "strategy")
+		return false
 	case "model_management":
-		return hasExplicitDiagnosisIntentForDomain(text, "exchange") || hasExplicitDiagnosisIntentForDomain(text, "trader") || hasExplicitDiagnosisIntentForDomain(text, "strategy")
+		return false
 	case "strategy_management":
-		return hasExplicitDiagnosisIntentForDomain(text, "exchange") || hasExplicitDiagnosisIntentForDomain(text, "trader") || hasExplicitDiagnosisIntentForDomain(text, "model")
+		return false
 	case "trader_management":
-		return hasExplicitDiagnosisIntentForDomain(text, "exchange") || hasExplicitDiagnosisIntentForDomain(text, "model") || hasExplicitDiagnosisIntentForDomain(text, "strategy")
+		return false
 	default:
 		return false
 	}
@@ -2225,13 +2277,13 @@ func isExplicitFlowAbort(text string) bool {
 func belongsToSkillDomain(skillName, text string) bool {
 	switch strings.TrimSpace(skillName) {
 	case "trader_management":
-		return hasExplicitCreateIntentForDomain(text, "trader") || hasExplicitDiagnosisIntentForDomain(text, "trader")
+		return hasExplicitCreateIntentForDomain(text, "trader")
 	case "strategy_management":
-		return hasExplicitDiagnosisIntentForDomain(text, "strategy")
+		return false
 	case "model_management":
-		return hasExplicitDiagnosisIntentForDomain(text, "model")
+		return false
 	case "exchange_management":
-		return hasExplicitDiagnosisIntentForDomain(text, "exchange")
+		return false
 	default:
 		return false
 	}
@@ -2245,11 +2297,7 @@ func looksLikeNewTopLevelIntent(text string) bool {
 	if strings.HasPrefix(lower, "/") {
 		return true
 	}
-	if hasExplicitCreateIntentForDomain(text, "trader") ||
-		hasExplicitDiagnosisIntentForDomain(text, "trader") ||
-		hasExplicitDiagnosisIntentForDomain(text, "exchange") ||
-		hasExplicitDiagnosisIntentForDomain(text, "model") ||
-		hasExplicitDiagnosisIntentForDomain(text, "strategy") {
+	if hasExplicitCreateIntentForDomain(text, "trader") {
 		return true
 	}
 	if detectReadFastPath(text) != nil {
@@ -2482,6 +2530,9 @@ func (a *Agent) tryRecoverFromInternalAgentJSON(ctx context.Context, storeUserID
 				Fields:           firstFlowExtractionFields(result),
 				Reason:           result.Reason,
 			}
+			if answer, handled, err := a.redirectExecutionStateStrategyCreate(ctx, storeUserID, userID, lang, text, state, onEvent); handled || err != nil {
+				return answer, handled, err
+			}
 			if session, ok := a.bridgeExecutionStateToSkillSession(storeUserID, userID, text, state, extraction); ok {
 				answer, handled := a.dispatchBridgedSkillSession(storeUserID, userID, lang, text, session)
 				return answer, handled, nil
@@ -2496,6 +2547,10 @@ func (a *Agent) runPlannedAgent(ctx context.Context, storeUserID string, userID 
 }
 
 func (a *Agent) runPlannedAgentWithContextMode(ctx context.Context, storeUserID string, userID int64, lang, text string, contextMode string, onEvent func(event, data string)) (string, error) {
+	if session, ok := a.activeStrategyCreateSession(userID); ok {
+		answer, _, err := a.driveActiveSession(ctx, storeUserID, userID, lang, text, session, onEvent)
+		return answer, err
+	}
 	a.history.Add(userID, "user", text)
 	if onEvent != nil {
 		onEvent(StreamEventPlanning, a.planningStatusText(lang))
@@ -2512,6 +2567,13 @@ func (a *Agent) runPlannedAgentWithContextMode(ctx context.Context, storeUserID 
 				emitStreamText(onEvent, msg)
 			}
 			return msg, nil
+		}
+		if hasExplicitCreateIntentForDomain(text, "strategy") {
+			a.logger.Warn("planner failed during strategy create; using template strategy flow instead of legacy loop", "error", err, "user_id", userID)
+			session := newActiveSkillSession(userID, "strategy_management", "create")
+			session.Goal = strings.TrimSpace(text)
+			answer, _, flowErr := a.driveActiveSession(ctx, storeUserID, userID, lang, text, session, onEvent)
+			return answer, flowErr
 		}
 		a.logger.Warn("planner failed, falling back to legacy loop", "error", err, "user_id", userID)
 		return a.thinkAndActLegacyWithStore(ctx, storeUserID, userID, lang, text, onEvent)
@@ -2533,10 +2595,21 @@ func (a *Agent) runPlannedAgentWithContextMode(ctx context.Context, storeUserID 
 		if answer, ok := a.tryExecutionSummaryFallbackOnAIError(lang, &state, err, onEvent); ok {
 			return answer, nil
 		}
+		if hasExplicitCreateIntentForDomain(state.Goal, "strategy") || hasExplicitCreateIntentForDomain(text, "strategy") {
+			a.logger.Warn("plan execution failed during strategy create; using template strategy flow instead of legacy loop", "error", err, "user_id", userID)
+			a.clearExecutionState(userID)
+			session := newActiveSkillSession(userID, "strategy_management", "create")
+			session.Goal = defaultIfEmpty(strings.TrimSpace(state.Goal), strings.TrimSpace(text))
+			answer, _, flowErr := a.driveActiveSession(ctx, storeUserID, userID, lang, text, session, onEvent)
+			return answer, flowErr
+		}
 		a.logger.Warn("plan execution failed, falling back to legacy loop", "error", err, "user_id", userID)
 		return a.thinkAndActLegacyWithStore(ctx, storeUserID, userID, lang, text, onEvent)
 	}
 
+	if guarded, blocked := guardUnsupportedAsyncPromise(lang, answer); blocked {
+		answer = guarded
+	}
 	a.history.Add(userID, "assistant", answer)
 	a.runPostResponseMaintenanceAsync(userID)
 	a.logPlannerTiming(state.SessionID, userID, "run_planned_agent_total", requestStartedAt, nil)
@@ -2763,9 +2836,9 @@ func (a *Agent) refreshStateForDynamicRequests(storeUserID, userText string, sta
 		case "current_strategies":
 			appendSnapshot(kind, a.toolGetStrategies(storeUserID))
 		case "current_balances":
-			appendSnapshot(kind, a.toolGetBalance())
+			appendSnapshot(kind, a.toolGetBalance(storeUserID))
 		case "current_positions":
-			appendSnapshot(kind, a.toolGetPositions())
+			appendSnapshot(kind, a.toolGetPositions(storeUserID))
 		case "recent_trade_history":
 			appendSnapshot(kind, a.toolGetTradeHistory(`{"limit":10}`))
 		}
@@ -2838,11 +2911,11 @@ Rules:
 - Use tool steps whenever fresh external data is required.
 - Use ask_user if required parameters are missing.
 - For config or create flows, prefer multi-slot ask_user prompts: ask for the main missing fields together instead of one field per turn whenever practical.
-- When safe defaults are common and the user has not expressed a preference, offer those defaults in the same ask_user turn instead of forcing a separate follow-up for every slot.
 - Never place a trade unless the user intent is explicit.
 - For exchange binding or exchange credential requests, prefer get_exchange_configs/manage_exchange_config.
 - For AI model binding or model credential requests, prefer get_model_configs/manage_model_config.
-- For strategy template creation or editing requests, prefer get_strategies/manage_strategy.
+- For strategy template editing/query requests, prefer get_strategies/manage_strategy.
+- For strategy template creation, do not call manage_strategy action=create from the planner. Strategy creation must be handled by the active strategy template flow so the selected product editor template can collect fields and require chat confirmation.
 - For trader creation or trader lifecycle requests, prefer manage_trader.
 - A strategy template is independent and does not require exchange/model bindings unless the user explicitly asks to run or deploy it through a trader.
 - Do NOT expand the goal beyond what the user explicitly requested. When the user's request is fulfilled, respond and stop. Do not proactively suggest or ask about the next logical step (e.g. do not ask "should I bind this to a trader?" after a strategy update unless the user asked for that).
@@ -3002,6 +3075,13 @@ func (a *Agent) executePlan(ctx context.Context, storeUserID string, userID int6
 
 		switch step.Type {
 		case planStepTypeTool:
+			if answer, handled := a.redirectPlannerStrategyCreateStep(storeUserID, userID, lang, state.Goal, *step); handled {
+				a.clearExecutionState(userID)
+				if onEvent != nil && strings.TrimSpace(answer) != "" {
+					emitStreamText(onEvent, answer)
+				}
+				return answer, nil
+			}
 			if onEvent != nil {
 				onEvent(StreamEventTool, step.ToolName)
 			}
@@ -3083,7 +3163,7 @@ func (a *Agent) executePlan(ctx context.Context, storeUserID string, userID int6
 				return finalText, nil
 			}
 			respondStartedAt := time.Now()
-			finalText, err := a.generateFinalPlanResponse(ctx, userID, lang, *state, step.Instruction)
+			finalText, err := a.generateFinalPlanResponse(ctx, storeUserID, userID, lang, *state, step.Instruction)
 			a.logPlannerTiming(state.SessionID, userID, "respond_step", respondStartedAt, err)
 			if err != nil {
 				return "", err
@@ -3575,6 +3655,38 @@ func (a *Agent) executePlanTool(ctx context.Context, storeUserID string, userID 
 	})
 }
 
+func (a *Agent) redirectPlannerStrategyCreateStep(storeUserID string, userID int64, lang, text string, step PlanStep) (string, bool) {
+	if strings.TrimSpace(step.ToolName) != "manage_strategy" {
+		return "", false
+	}
+	action, _ := step.ToolArgs["action"].(string)
+	if strings.TrimSpace(action) != "create" {
+		return "", false
+	}
+	session := skillSession{
+		Name:   "strategy_management",
+		Action: "create",
+		Phase:  "collecting",
+		Fields: map[string]string{},
+	}
+	if name, _ := step.ToolArgs["name"].(string); strings.TrimSpace(name) != "" {
+		setField(&session, "name", name)
+	}
+	if rawConfig, ok := step.ToolArgs["config"]; ok {
+		if strategyType := strategyTypeFromConfigPatchAny(rawConfig); strategyType != "" {
+			setStrategyCreateType(&session, strategyType)
+			if sanitized := sanitizeStrategyCreateConfigPatchForType(rawConfig, strategyType); len(sanitized) > 0 {
+				raw, _ := json.Marshal(sanitized)
+				setField(&session, strategyCreateConfigPatchField, string(raw))
+			}
+		}
+	}
+	if confirmed, ok := step.ToolArgs["confirmed"].(bool); ok && confirmed {
+		setField(&session, "awaiting_final_confirmation", "true")
+	}
+	return a.handleStrategyCreateSkill(storeUserID, userID, lang, text, session), true
+}
+
 func (a *Agent) executeReasonStep(ctx context.Context, userID int64, lang, goal string, state ExecutionState, step PlanStep) (string, error) {
 	obsJSON, _ := json.Marshal(buildObservationContext(state))
 	stageCtx, cancel := withPlannerStageTimeout(ctx, plannerReasonTimeout)
@@ -3595,9 +3707,8 @@ func (a *Agent) executeReasonStep(ctx context.Context, userID int64, lang, goal 
 	return summarizeObservation(resp), nil
 }
 
-func (a *Agent) generateFinalPlanResponse(ctx context.Context, userID int64, lang string, state ExecutionState, instruction string) (string, error) {
+func (a *Agent) generateFinalPlanResponse(ctx context.Context, storeUserID string, userID int64, lang string, state ExecutionState, instruction string) (string, error) {
 	obsJSON, _ := json.Marshal(buildObservationContext(state))
-	systemPrompt := a.buildSystemPrompt(lang)
 	if instruction == "" {
 		instruction = "Provide the best possible final response to the user based on the finished execution."
 	}
@@ -3606,7 +3717,7 @@ func (a *Agent) generateFinalPlanResponse(ctx context.Context, userID int64, lan
 	startedAt := time.Now()
 	resp, err := a.aiClient.CallWithRequest(&mcp.Request{
 		Messages: []mcp.Message{
-			mcp.NewSystemMessage(systemPrompt),
+			mcp.NewSystemMessage(finalPlanResponseSystemPrompt(lang)),
 			mcp.NewSystemMessage("You are responding after a completed execution plan. Use the observations as the source of truth. Be concise and actionable."),
 			mcp.NewSystemMessage(cleanUserFacingReplyInstruction),
 			mcp.NewUserMessage(fmt.Sprintf("Goal: %s\nResponse instruction: %s\nObservations JSON: %s\nPersistent preferences: %s\nTask state: %s", state.Goal, instruction, string(obsJSON), a.buildPersistentPreferencesContext(userID), buildTaskStateContext(a.getTaskState(userID)))),
@@ -3615,6 +3726,21 @@ func (a *Agent) generateFinalPlanResponse(ctx context.Context, userID int64, lan
 	})
 	a.logPlannerTiming(state.SessionID, userID, "generate_final_response_llm", startedAt, err)
 	return resp, err
+}
+
+func finalPlanResponseSystemPrompt(lang string) string {
+	if lang == "zh" {
+		return `你是 NOFXi 的执行结果回复模块。
+只根据 Observations JSON 和已完成步骤回答用户。
+不要引入未观察到的策略、交易员、模型或交易所信息。
+不要承诺稍后通知；如果工具已经执行，直接说结果；如果工具失败，直接说失败原因和下一步。
+用中文，简洁清楚。`
+	}
+	return `You are NOFXi's execution-result response module.
+Answer only from Observations JSON and completed steps.
+Do not introduce unobserved strategy, trader, model, or exchange details.
+Do not promise later notification; if a tool executed, state the result; if it failed, state the reason and next step.
+Be concise and clear.`
 }
 
 func (a *Agent) logPlannerTiming(sessionID string, userID int64, stage string, startedAt time.Time, err error) {
@@ -3770,8 +3896,8 @@ func (a *Agent) thinkAndActLegacy(ctx context.Context, userID int64, lang, text 
 }
 
 func (a *Agent) thinkAndActLegacyWithStore(ctx context.Context, storeUserID string, userID int64, lang, text string, onEvent func(event, data string)) (string, error) {
-	systemPrompt := a.buildSystemPrompt(lang)
-	enrichment := a.gatherContext(text)
+	systemPrompt := a.buildSystemPromptForStoreUser(lang, storeUserID)
+	enrichment := a.gatherContext(storeUserID, text)
 	preferencesCtx := a.buildPersistentPreferencesContext(userID)
 
 	userPrompt := text
@@ -3864,7 +3990,15 @@ func (a *Agent) thinkAndActLegacyWithStore(ctx context.Context, storeUserID stri
 				return "I can tell you're continuing the previous task, but the internal response format was invalid. Please repeat that step and I'll keep going.", nil
 			}
 			if onEvent != nil {
-				emitStreamText(onEvent, resp.Content)
+				reply := resp.Content
+				if guarded, blocked := guardUnsupportedAsyncPromise(lang, reply); blocked {
+					reply = guarded
+				}
+				emitStreamText(onEvent, reply)
+				return reply, nil
+			}
+			if guarded, blocked := guardUnsupportedAsyncPromise(lang, resp.Content); blocked {
+				return guarded, nil
 			}
 			return resp.Content, nil
 		}
@@ -3910,7 +4044,14 @@ func (a *Agent) thinkAndActLegacyWithStore(ctx context.Context, storeUserID stri
 		return "I can tell you're continuing the previous task, but the internal response format was invalid. Please repeat that step and I'll keep going.", nil
 	}
 	if onEvent != nil {
+		if guarded, blocked := guardUnsupportedAsyncPromise(lang, finalResp); blocked {
+			finalResp = guarded
+		}
 		emitStreamText(onEvent, finalResp)
+		return finalResp, nil
+	}
+	if guarded, blocked := guardUnsupportedAsyncPromise(lang, finalResp); blocked {
+		return guarded, nil
 	}
 	return finalResp, nil
 }

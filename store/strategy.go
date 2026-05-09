@@ -34,6 +34,8 @@ const (
 
 // ClampLimits enforces product-level limits on strategy config to prevent token overflow.
 func (c *StrategyConfig) ClampLimits() {
+	c.NormalizeProductSchema()
+
 	// Clamp coin source limits
 	if c.CoinSource.AI500Limit > MaxCandidateCoins {
 		c.CoinSource.AI500Limit = MaxCandidateCoins
@@ -127,6 +129,208 @@ func (c *StrategyConfig) ClampLimits() {
 	if c.RiskControl.MinConfidence > MaxConfidence {
 		c.RiskControl.MinConfidence = MaxConfidence
 	}
+}
+
+// NormalizeProductSchema keeps saved strategy JSON aligned with the product
+// editor schema. LLMs may emit user-facing labels such as "AI500"; persistence
+// must use the exact frontend/backend enum values.
+func (c *StrategyConfig) NormalizeProductSchema() {
+	c.StrategyType = normalizeStrategyType(c.StrategyType)
+	c.CoinSource.SourceType = normalizeCoinSourceType(c.CoinSource.SourceType)
+	if c.CoinSource.SourceType == "" {
+		c.CoinSource.SourceType = inferCoinSourceType(c.CoinSource)
+	}
+
+	switch c.CoinSource.SourceType {
+	case "ai500":
+		c.CoinSource.UseAI500 = true
+		c.CoinSource.UseOITop = false
+		c.CoinSource.UseOILow = false
+		if c.CoinSource.AI500Limit <= 0 {
+			c.CoinSource.AI500Limit = 3
+		}
+	case "oi_top":
+		c.CoinSource.UseAI500 = false
+		c.CoinSource.UseOITop = true
+		c.CoinSource.UseOILow = false
+		if c.CoinSource.OITopLimit <= 0 {
+			c.CoinSource.OITopLimit = 3
+		}
+	case "oi_low":
+		c.CoinSource.UseAI500 = false
+		c.CoinSource.UseOITop = false
+		c.CoinSource.UseOILow = true
+		if c.CoinSource.OILowLimit <= 0 {
+			c.CoinSource.OILowLimit = 3
+		}
+	case "static":
+		c.CoinSource.UseAI500 = false
+		c.CoinSource.UseOITop = false
+		c.CoinSource.UseOILow = false
+	default:
+		c.CoinSource.SourceType = "ai500"
+		c.CoinSource.UseAI500 = true
+		if c.CoinSource.AI500Limit <= 0 {
+			c.CoinSource.AI500Limit = 3
+		}
+	}
+
+	c.CoinSource.StaticCoins = normalizeSymbols(c.CoinSource.StaticCoins)
+	c.CoinSource.ExcludedCoins = normalizeSymbols(c.CoinSource.ExcludedCoins)
+	c.Indicators.Klines.PrimaryTimeframe = normalizeTimeframe(c.Indicators.Klines.PrimaryTimeframe)
+	c.Indicators.Klines.LongerTimeframe = normalizeTimeframe(c.Indicators.Klines.LongerTimeframe)
+	c.Indicators.Klines.SelectedTimeframes = normalizeTimeframes(c.Indicators.Klines.SelectedTimeframes)
+	if len(c.Indicators.Klines.SelectedTimeframes) > 0 {
+		c.Indicators.Klines.EnableMultiTimeframe = true
+	}
+}
+
+func normalizeStrategyType(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "grid", "grid_strategy", "grid-trading", "grid trading", "grid_trading", "网格", "网格策略", "网格交易":
+		return "grid_trading"
+	case "", "ai", "ai_strategy", "ai-trading", "ai trading", "ai_trading", "ai策略", "ai 策略", "ai交易策略", "ai智能策略":
+		return "ai_trading"
+	default:
+		return value
+	}
+}
+
+func normalizeCoinSourceType(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	compact := strings.NewReplacer(" ", "", "_", "", "-", "", "数据源", "", "选币", "", "币种", "").Replace(value)
+	switch {
+	case compact == "":
+		return ""
+	case strings.Contains(compact, "ai500"):
+		return "ai500"
+	case strings.Contains(compact, "oitop") || strings.Contains(value, "oi top") || strings.Contains(value, "持仓量最高") || strings.Contains(value, "持仓量靠前"):
+		return "oi_top"
+	case strings.Contains(compact, "oilow") || strings.Contains(value, "oi low") || strings.Contains(value, "持仓量最低") || strings.Contains(value, "持仓量较低"):
+		return "oi_low"
+	case strings.Contains(value, "static") || strings.Contains(value, "固定") || strings.Contains(value, "静态"):
+		return "static"
+	default:
+		return value
+	}
+}
+
+func inferCoinSourceType(source CoinSourceConfig) string {
+	switch {
+	case len(source.StaticCoins) > 0:
+		return "static"
+	case source.UseAI500:
+		return "ai500"
+	case source.UseOITop:
+		return "oi_top"
+	case source.UseOILow:
+		return "oi_low"
+	default:
+		return "ai500"
+	}
+}
+
+func normalizeSymbols(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, value := range splitLooseStringList(values) {
+		value = strings.ToUpper(strings.TrimSpace(value))
+		value = strings.Trim(value, "，,;； ")
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func normalizeTimeframes(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, value := range splitLooseStringList(values) {
+		tf := normalizeTimeframe(value)
+		if tf == "" || seen[tf] {
+			continue
+		}
+		seen[tf] = true
+		out = append(out, tf)
+	}
+	return out
+}
+
+func splitLooseStringList(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	joined := strings.TrimSpace(strings.Join(values, ","))
+	if strings.HasPrefix(joined, "[") && strings.HasSuffix(joined, "]") {
+		var parsed []string
+		if err := json.Unmarshal([]byte(joined), &parsed); err == nil {
+			return parsed
+		}
+	}
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+			var parsed []string
+			if err := json.Unmarshal([]byte(value), &parsed); err == nil {
+				parts = append(parts, parsed...)
+				continue
+			}
+		}
+		value = strings.Trim(value, "[]")
+		for _, part := range strings.FieldsFunc(value, func(r rune) bool {
+			return r == ',' || r == '，' || r == ';' || r == '；' || r == '\n'
+		}) {
+			part = strings.Trim(strings.TrimSpace(part), "\"'")
+			if part != "" {
+				parts = append(parts, part)
+			}
+		}
+	}
+	return parts
+}
+
+func normalizeTimeframe(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.Trim(value, "\"'，,。 ")
+	if value == "" {
+		return ""
+	}
+	aliases := map[string]string{
+		"1分钟":  "1m",
+		"3分钟":  "3m",
+		"5分钟":  "5m",
+		"15分钟": "15m",
+		"30分钟": "30m",
+		"1小时":  "1h",
+		"2小时":  "2h",
+		"4小时":  "4h",
+		"6小时":  "6h",
+		"8小时":  "8h",
+		"12小时": "12h",
+		"1天":   "1d",
+		"3天":   "3d",
+		"1周":   "1w",
+	}
+	if alias, ok := aliases[value]; ok {
+		return alias
+	}
+	allowed := map[string]bool{
+		"1m": true, "3m": true, "5m": true, "15m": true, "30m": true,
+		"1h": true, "2h": true, "4h": true, "6h": true, "8h": true, "12h": true,
+		"1d": true, "3d": true, "1w": true,
+	}
+	if !allowed[value] {
+		return ""
+	}
+	return value
 }
 
 // MergeStrategyConfig applies a partial JSON-style patch onto a full strategy config.
@@ -489,7 +693,7 @@ type PromptSectionsConfig struct {
 
 // CoinSourceConfig coin source configuration
 type CoinSourceConfig struct {
-	// source type: "static" | "ai500" | "oi_top" | "oi_low" | "mixed"
+	// source type shown in the product editor: "static" | "ai500" | "oi_top" | "oi_low"
 	SourceType string `json:"source_type"`
 	// static coin list (used when source_type = "static")
 	StaticCoins []string `json:"static_coins,omitempty"`
@@ -1186,16 +1390,6 @@ func (c *StrategyConfig) getEffectiveCoinCount() int {
 		count = c.CoinSource.OITopLimit
 	case "oi_low":
 		count = c.CoinSource.OILowLimit
-	case "mixed":
-		if c.CoinSource.UseAI500 {
-			count += c.CoinSource.AI500Limit
-		}
-		if c.CoinSource.UseOITop {
-			count += c.CoinSource.OITopLimit
-		}
-		if c.CoinSource.UseOILow {
-			count += c.CoinSource.OILowLimit
-		}
 	default:
 		count = c.CoinSource.AI500Limit
 	}

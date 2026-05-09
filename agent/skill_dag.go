@@ -129,12 +129,9 @@ func buildSkillDAGRegistry() map[string]SkillDAG {
 			SkillName: "strategy_management",
 			Action:    "update_config",
 			Steps: []SkillDAGStep{
-				{ID: "resolve_target", Kind: "resolve_target", RequiredFields: []string{"target_ref"}, Next: []string{"resolve_config_field"}},
-				{ID: "resolve_config_field", Kind: "collect_slot", RequiredFields: []string{"config_field"}, Next: []string{"resolve_config_value"}},
-				{ID: "resolve_config_value", Kind: "collect_slot", RequiredFields: []string{"config_value"}, Next: []string{"load_config"}},
-				{ID: "load_config", Kind: "load_state", RequiredFields: []string{"target_ref"}, Next: []string{"apply_field_update"}},
-				{ID: "apply_field_update", Kind: "transform", RequiredFields: []string{"config_field", "config_value"}, Next: []string{"execute_update"}},
-				{ID: "execute_update", Kind: "execute", RequiredFields: []string{"target_ref", "config_field", "config_value"}, Terminal: true},
+				{ID: "resolve_target", Kind: "resolve_target", RequiredFields: []string{"target_ref"}, Next: []string{"collect_config_patch"}},
+				{ID: "collect_config_patch", Kind: "collect_slot", RequiredFields: []string{"config_patch"}, Next: []string{"execute_update"}},
+				{ID: "execute_update", Kind: "execute", RequiredFields: []string{"target_ref", "config_patch"}, Terminal: true},
 			},
 		},
 		{
