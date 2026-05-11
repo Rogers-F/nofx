@@ -2628,6 +2628,12 @@ func (a *Agent) runPostResponseMaintenanceAsync(userID int64) {
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
+		// Respect agent shutdown: abort early if stopCh is closed.
+		select {
+		case <-a.stopCh:
+			return
+		default:
+		}
 		a.maybeUpdateTaskStateIncrementally(ctx, userID)
 		a.maybeCompressHistory(ctx, userID)
 	}()

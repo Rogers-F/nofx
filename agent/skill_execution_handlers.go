@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"nofx/mcp"
 	"nofx/store"
@@ -2757,7 +2758,9 @@ func (a *Agent) handleTraderDiagnosisSkill(storeUserID, lang, text string) strin
 	}
 
 	evidence := a.collectTraderDiagnosisEvidence(storeUserID, target.ID, target.Name)
-	if answer, ok := a.generateTraderDiagnosisAnswerWithLLM(context.Background(), lang, text, evidence); ok {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if answer, ok := a.generateTraderDiagnosisAnswerWithLLM(ctx, lang, text, evidence); ok {
 		return answer
 	}
 	return formatTraderDiagnosisEvidence(lang, evidence)
