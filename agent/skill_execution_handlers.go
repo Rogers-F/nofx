@@ -1479,6 +1479,12 @@ func (a *Agent) executeTraderManagementAction(storeUserID string, userID int64, 
 		}
 		return formatReadFastPathResponse(lang, "list_traders", a.toolListTraders(storeUserID))
 	case "start", "stop", "delete":
+		if session.TargetRef == nil && !(session.Action == "delete" && fieldValue(session, "bulk_scope") == "all") {
+			if lang == "zh" {
+				return "请先指定要操作的交易员。"
+			}
+			return "Please specify which trader to operate on."
+		}
 		if fieldValue(session, skillDAGStepField) == "" {
 			setSkillDAGStep(&session, "await_confirmation")
 		}
@@ -1895,6 +1901,17 @@ func (a *Agent) executeBulkTraderDelete(storeUserID string, userID int64, lang, 
 
 func (a *Agent) executeExchangeManagementAction(storeUserID string, userID int64, lang, text string, session skillSession) string {
 	switch session.Action {
+	case "query", "query_list", "create":
+		// These actions don't need a target — fall through.
+	default:
+		if session.TargetRef == nil {
+			if lang == "zh" {
+				return "请先指定要操作的交易所配置。"
+			}
+			return "Please specify which exchange config to operate on."
+		}
+	}
+	switch session.Action {
 	case "query_detail":
 		if detail, ok := a.describeExchange(storeUserID, lang, session.TargetRef); ok {
 			return detail
@@ -2070,6 +2087,17 @@ func (a *Agent) executeExchangeManagementAction(storeUserID string, userID int64
 
 func (a *Agent) executeModelManagementAction(storeUserID string, userID int64, lang, text string, session skillSession) string {
 	switch session.Action {
+	case "query", "query_list", "create":
+		// These actions don't need a target — fall through.
+	default:
+		if session.TargetRef == nil {
+			if lang == "zh" {
+				return "请先指定要操作的模型。"
+			}
+			return "Please specify which model to operate on."
+		}
+	}
+	switch session.Action {
 	case "query_detail":
 		if detail, ok := a.describeModel(storeUserID, lang, session.TargetRef); ok {
 			return detail
@@ -2228,6 +2256,18 @@ func (a *Agent) executeModelManagementAction(storeUserID string, userID int64, l
 }
 
 func (a *Agent) executeStrategyManagementAction(storeUserID string, userID int64, lang, text string, session skillSession) string {
+	switch session.Action {
+	case "query", "query_list", "create":
+		// These actions don't need a target — fall through.
+	default:
+		isBulkDelete := session.Action == "delete" && fieldValue(session, "bulk_scope") == "all"
+		if session.TargetRef == nil && !isBulkDelete {
+			if lang == "zh" {
+				return "请先指定要操作的策略。"
+			}
+			return "Please specify which strategy to operate on."
+		}
+	}
 	switch session.Action {
 	case "query", "query_list":
 		return formatReadFastPathResponse(lang, "get_strategies", a.toolGetStrategies(storeUserID))

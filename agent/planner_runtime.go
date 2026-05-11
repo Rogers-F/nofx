@@ -2551,6 +2551,7 @@ func (a *Agent) runPlannedAgentWithContextMode(ctx context.Context, storeUserID 
 		answer, _, err := a.driveActiveSession(ctx, storeUserID, userID, lang, text, session, onEvent)
 		return answer, err
 	}
+	a.ensureHistory()
 	a.history.Add(userID, "user", text)
 	if onEvent != nil {
 		onEvent(StreamEventPlanning, a.planningStatusText(lang))

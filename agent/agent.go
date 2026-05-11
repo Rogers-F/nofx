@@ -80,6 +80,12 @@ func New(tm *manager.TraderManager, st *store.Store, cfg *Config, logger *slog.L
 
 func (a *Agent) SetAIClient(c mcp.AIClient) { a.aiClient = c }
 
+func (a *Agent) ensureHistory() {
+	if a.history == nil {
+		a.history = newChatHistory(100)
+	}
+}
+
 func (a *Agent) log() *slog.Logger {
 	if a != nil && a.logger != nil {
 		return a.logger
