@@ -116,8 +116,6 @@ export default function HeaderBar({
                   path: ROUTES.agent,
                   label: 'Agent',
                   requiresAuth: false,
-                  badge: 'Beta',
-                  hidden: true,
                 },
                 {
                   page: 'data',
@@ -453,8 +451,6 @@ export default function HeaderBar({
                       path: ROUTES.agent,
                       label: 'Agent',
                       requiresAuth: false,
-                      badge: 'Beta',
-                      hidden: true,
                     },
                     {
                       page: 'data',
