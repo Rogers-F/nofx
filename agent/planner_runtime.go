@@ -2712,6 +2712,11 @@ Return JSON only. Do not return markdown.
 You are operating in ReAct mode: Thought -> Action -> Observation.
 Choose the immediate next action batch. Do not generate a long multi-step execution plan.
 
+CRITICAL — Minimal tool principle:
+- Only call tools that DIRECTLY answer the user's Goal.
+- Do NOT call extra tools "just in case" or "for context". If the user asks about their wallet address, do NOT also fetch market data or balances.
+- If the user asks one question, call one tool (or zero if you already have the answer).
+
 Allowed step types:
 - tool
 - reason
@@ -2740,6 +2745,7 @@ Rules:
 - For ask_user or respond steps, put the user-facing question/response instruction in instruction.
 - If the latest observation already answers the goal, prefer respond over another tool call.
 - Never place a trade unless the user intent is explicit.
+- Do NOT plan a self-introduction or capability overview unless the user explicitly asks "what can you do". Answer the user's question directly.
 
 Return JSON with this exact shape:
 {"goal":"","steps":[{"id":"step_1","type":"tool|reason|ask_user|respond","title":"","tool_name":"","tool_args":{},"instruction":"","requires_confirmation":false}]}`
@@ -3715,19 +3721,19 @@ func (a *Agent) executeReasonStep(ctx context.Context, userID int64, lang, goal 
 }
 
 func (a *Agent) generateFinalPlanResponse(ctx context.Context, storeUserID string, userID int64, lang string, state ExecutionState, instruction string) (string, error) {
-	obsJSON, _ := json.Marshal(buildObservationContext(state))
 	if instruction == "" {
 		instruction = "Provide the best possible final response to the user based on the finished execution."
 	}
+	// Build a compact observation summary: only step summaries, no raw JSON blobs.
+	obsSummary := buildCompactObservationSummary(state)
+	conversationCtx := a.buildRecentConversationContext(userID, state.Goal)
 	stageCtx, cancel := withPlannerStageTimeout(ctx, plannerFinalTimeout)
 	defer cancel()
 	startedAt := time.Now()
 	resp, err := a.aiClient.CallWithRequest(&mcp.Request{
 		Messages: []mcp.Message{
 			mcp.NewSystemMessage(finalPlanResponseSystemPrompt(lang)),
-			mcp.NewSystemMessage("You are responding after a completed execution plan. Use the observations as the source of truth. Be concise and actionable."),
-			mcp.NewSystemMessage(cleanUserFacingReplyInstruction),
-			mcp.NewUserMessage(fmt.Sprintf("Goal: %s\nResponse instruction: %s\nObservations JSON: %s\nPersistent preferences: %s\nTask state: %s", state.Goal, instruction, string(obsJSON), a.buildPersistentPreferencesContext(userID), buildTaskStateContext(a.getTaskState(userID)))),
+			mcp.NewUserMessage(fmt.Sprintf("Goal: %s\nInstruction: %s\nRecent conversation:\n%s\nTool results:\n%s\nPreferences:\n%s", state.Goal, instruction, defaultIfEmpty(conversationCtx, "(first message)"), obsSummary, a.buildPersistentPreferencesContext(userID))),
 		},
 		Ctx: stageCtx,
 	})
@@ -3735,19 +3741,57 @@ func (a *Agent) generateFinalPlanResponse(ctx context.Context, storeUserID strin
 	return resp, err
 }
 
+// buildCompactObservationSummary extracts only the step summaries from an
+// execution state, omitting raw JSON, dynamic snapshots, and other bulk data.
+// This prevents the final-response LLM from being overwhelmed with irrelevant
+// data and producing verbose, off-topic replies.
+func buildCompactObservationSummary(state ExecutionState) string {
+	state = normalizeExecutionState(state)
+	var parts []string
+	for _, step := range state.Steps {
+		if step.Status != planStepStatusCompleted || step.OutputSummary == "" {
+			continue
+		}
+		label := step.ToolName
+		if label == "" {
+			label = step.Title
+		}
+		if label == "" {
+			label = step.ID
+		}
+		summary := step.OutputSummary
+		if len(summary) > 800 {
+			summary = summary[:800] + "..."
+		}
+		parts = append(parts, fmt.Sprintf("[%s]: %s", label, summary))
+	}
+	if len(parts) == 0 {
+		return "(no tool results)"
+	}
+	return strings.Join(parts, "\n\n")
+}
+
 func finalPlanResponseSystemPrompt(lang string) string {
 	if lang == "zh" {
-		return `你是 NOFXi 的执行结果回复模块。
-只根据 Observations JSON 和已完成步骤回答用户。
-不要引入未观察到的策略、交易员、模型或交易所信息。
-不要承诺稍后通知；如果工具已经执行，直接说结果；如果工具失败，直接说失败原因和下一步。
-用中文，简洁清楚。`
+		return `你是 NOFXi，用户的 AI 交易伙伴。像朋友聊天一样回复。
+
+严格规则：
+- 只回答 Goal 问的那一件事。用户问余额就只说余额，问持仓就只说持仓，问钱包就只说钱包。
+- Tool results 里有很多数据，但你只用跟 Goal 直接相关的。其余的不要提。
+- 数据为空就说"暂时查不到"加一句原因，不要展开教程。
+- 不要输出表格、分隔线、markdown 标题，除非数据本身需要对比。
+- 不要列"下一步建议"或"需要我帮你做什么"，除非用户主动问。
+- 回复尽量短，能一句话说清的不要写一段话。`
 	}
-	return `You are NOFXi's execution-result response module.
-Answer only from Observations JSON and completed steps.
-Do not introduce unobserved strategy, trader, model, or exchange details.
-Do not promise later notification; if a tool executed, state the result; if it failed, state the reason and next step.
-Be concise and clear.`
+	return `You are NOFXi, the user's AI trading partner. Reply like a friend chatting.
+
+Strict rules:
+- Answer ONLY the one thing asked in Goal. If user asks balance, only say balance. If user asks positions, only say positions.
+- Tool results contain lots of data, but you only use what is directly relevant to the Goal. Do not mention the rest.
+- If data is empty, say "can't fetch right now" plus one sentence why. Do not expand into tutorials.
+- Do not output tables, dividers, or markdown headers unless the data itself needs comparison.
+- Do not list "next step suggestions" or "want me to help you with X?" unless the user explicitly asks.
+- Keep it short. If you can say it in one sentence, don't write a paragraph.`
 }
 
 func (a *Agent) logPlannerTiming(sessionID string, userID int64, stage string, startedAt time.Time, err error) {
@@ -3935,7 +3979,12 @@ func (a *Agent) thinkAndActLegacyWithStore(ctx context.Context, storeUserID stri
 	}
 	messages = append(messages, mcp.NewUserMessage(userPrompt))
 
-	tools := agentTools()
+	// Use domain-filtered tools to reduce over-fetching; fall back to full set
+	// for "general" domain to preserve full functionality.
+	tools := plannerToolsForText(text)
+	if plannerToolDomainForText(text) == "general" {
+		tools = agentTools()
+	}
 
 	const maxToolRounds = 5
 	for round := 0; round < maxToolRounds; round++ {

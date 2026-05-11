@@ -70,7 +70,7 @@ func plannerToolDomainForText(text string) string {
 	if hasExplicitManagementDomainCue(text, "trader") || containsAny(lower, []string{"交易员", "trader", "启动", "停止交易员", "扫描间隔", "竞技场"}) {
 		return "trader"
 	}
-	if containsAny(lower, []string{"余额", "资产", "仓位", "持仓", "订单", "成交", "交易历史", "balance", "position", "positions", "trade history", "account"}) {
+	if containsAny(lower, []string{"余额", "资产", "仓位", "持仓", "订单", "成交", "交易历史", "balance", "position", "positions", "trade history", "account", "钱包", "wallet"}) {
 		return "account"
 	}
 	if containsAny(lower, []string{"行情", "价格", "k线", "kline", "market", "price", "btc", "eth", "sol", "usdt", "股票", "stock"}) {
@@ -84,7 +84,7 @@ func plannerToolNamesForDomain(domain string) []string {
 	case "market":
 		return []string{"get_market_snapshot", "get_market_price", "get_kline", "search_stock"}
 	case "account":
-		return []string{"get_balance", "get_positions", "get_trade_history"}
+		return []string{"get_balance", "get_positions", "get_trade_history", "get_exchange_configs"}
 	case "trader":
 		return []string{"get_model_configs", "get_exchange_configs", "get_strategies", "manage_trader"}
 	case "model":

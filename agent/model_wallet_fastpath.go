@@ -8,11 +8,19 @@ import (
 
 func isModelWalletBalanceQuestion(text string) bool {
 	lower := strings.ToLower(strings.TrimSpace(text))
-	if lower == "" || !strings.Contains(lower, "claw402") {
+	if lower == "" {
 		return false
 	}
-	return containsAny(lower, []string{"余额", "balance", "usdc"}) &&
-		containsAny(lower, []string{"钱包", "wallet", "主钱包", "base"})
+	// Direct wallet address questions: "我的钱包地址", "wallet address", etc.
+	if containsAny(lower, []string{"钱包", "wallet"}) && containsAny(lower, []string{"地址", "address"}) {
+		return true
+	}
+	// Balance questions with wallet context
+	if containsAny(lower, []string{"余额", "balance", "usdc"}) &&
+		containsAny(lower, []string{"钱包", "wallet", "主钱包", "base", "claw402"}) {
+		return true
+	}
+	return false
 }
 
 func (a *Agent) handleModelWalletBalanceQuestion(storeUserID, lang, text string) (string, bool) {
