@@ -1516,6 +1516,7 @@ func (a *Agent) toolManageExchangeConfig(storeUserID, argsJSON string) string {
 			testnet,
 			strings.TrimSpace(args.HyperliquidWalletAddr),
 			unified,
+			false,
 			strings.TrimSpace(args.AsterUser),
 			strings.TrimSpace(args.AsterSigner),
 			strings.TrimSpace(args.AsterPrivateKey),
@@ -1647,6 +1648,7 @@ func (a *Agent) toolManageExchangeConfig(storeUserID, argsJSON string) string {
 			testnet,
 			hyperWallet,
 			unified,
+			existing.HyperliquidBuilderApproved,
 			asterUser,
 			asterSigner,
 			strings.TrimSpace(args.AsterPrivateKey),
@@ -2518,8 +2520,12 @@ func (a *Agent) toolStartTrader(storeUserID, traderID string) string {
 	if a.traderManager == nil {
 		return `{"error":"trader manager unavailable"}`
 	}
-	if _, err := a.store.Trader().GetFullConfig(storeUserID, traderID); err != nil {
+	fullCfg, err := a.store.Trader().GetFullConfig(storeUserID, traderID)
+	if err != nil {
 		return fmt.Sprintf(`{"error":"trader not found or inaccessible: %s"}`, err)
+	}
+	if fullCfg != nil && fullCfg.Exchange != nil && fullCfg.Exchange.ExchangeType == "hyperliquid" && !fullCfg.Exchange.HyperliquidBuilderApproved {
+		return `{"error":"Hyperliquid trading authorization is incomplete; reconnect Hyperliquid wallet and complete trading authorization before starting this trader"}`
 	}
 	if existing, err := a.traderManager.GetTrader(traderID); err == nil {
 		if running, ok := existing.GetStatus()["is_running"].(bool); ok && running {

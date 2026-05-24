@@ -7,6 +7,7 @@ import {
   Wallet,
   Bot,
   Bookmark,
+  Zap,
   ChevronDown,
   ChevronRight,
 } from 'lucide-react'
@@ -19,6 +20,8 @@ import { WelcomeScreen } from '../components/agent/WelcomeScreen'
 import { ChatMessages } from '../components/agent/ChatMessages'
 import { ChatInput, type ChatInputHandle } from '../components/agent/ChatInput'
 import { UserPreferencesPanel } from '../components/agent/UserPreferencesPanel'
+import { HyperliquidSymbolsPanel } from '../components/agent/HyperliquidSymbolsPanel'
+import { createHyperliquidQuickTrader } from '../lib/hyperliquidQuickTrade'
 import { useAgentChatStore } from '../stores/agentChatStore'
 import type { AgentMessage as Message, AgentStep } from '../types/agent'
 import {
@@ -459,6 +462,7 @@ export function AgentChatPage() {
   const setDraftText = useAgentChatStore((state) => state.setDraftText)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const chatInputRef = useRef<ChatInputHandle>(null)
+  const pendingHyperSymbolRef = useRef<string | null>(null)
 
   // Sidebar section collapse state
   const [sections, setSections] = useState({
@@ -466,6 +470,7 @@ export function AgentChatPage() {
     positions: true,
     traders: false,
     preferences: true,
+    hyperliquid: true,
   })
 
   const toggleSection = (key: keyof typeof sections) => {
@@ -577,9 +582,88 @@ export function AgentChatPage() {
     chatInputRef.current?.focus()
   }
 
+  const tradeHyperliquidSymbol = async (symbol: { symbol: string; display?: string; category?: string }) => {
+    const label = symbol.display || symbol.symbol
+    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    patchMessagesInStore(
+      (prev) => [
+        ...prev,
+        {
+          id: nextId(),
+          role: 'user',
+          text:
+            language === 'zh'
+              ? `快速创建 Hyperliquid ${label} 单标的交易员`
+              : `Quick-create a Hyperliquid ${label} single-symbol trader`,
+          time,
+        },
+        {
+          id: nextId(),
+          role: 'bot',
+          text: language === 'zh' ? '正在直接创建策略和 Trader，不再走聊天意图猜测…' : 'Creating the strategy and trader directly, without routing through chat intent guessing…',
+          time,
+          streaming: true,
+        },
+      ],
+      user?.id || storageUserId
+    )
+    try {
+      const result = await createHyperliquidQuickTrader(symbol, language === 'zh' ? 'zh' : 'en')
+      patchMessagesInStore(
+        (prev) =>
+          prev.map((m) =>
+            m.streaming
+              ? {
+                  ...m,
+                  streaming: false,
+                  time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                  text:
+                    language === 'zh'
+                      ? `${result.reusedTrader ? '已找到并复用' : '已创建'} Hyperliquid ${result.display} 单标的 Trader：${result.traderName}\n\n策略：${result.strategyName}\n标的：${result.display}\n\n我没有自动启动实盘交易。请到 Traders 面板确认风控后手动 Start。`
+                      : `${result.reusedTrader ? 'Reused existing' : 'Created'} Hyperliquid ${result.display} single-symbol trader: ${result.traderName}\n\nStrategy: ${result.strategyName}\nSymbol: ${result.display}\n\nLive trading was not auto-started. Review risk controls in Traders, then start manually.`,
+                }
+              : m
+          ),
+        user?.id || storageUserId
+      )
+      window.dispatchEvent(new CustomEvent('agent-config-refresh'))
+    } catch (err: any) {
+      patchMessagesInStore(
+        (prev) =>
+          prev.map((m) =>
+            m.streaming
+              ? {
+                  ...m,
+                  streaming: false,
+                  time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+                  text: `⚠️ ${err?.message || 'Failed to create quick trader'}`,
+                }
+              : m
+          ),
+        user?.id || storageUserId
+      )
+    }
+  }
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const symbol = params.get('hyperSymbol')
+    if (!symbol || pendingHyperSymbolRef.current === symbol || loading) return
+    pendingHyperSymbolRef.current = symbol
+    void tradeHyperliquidSymbol({
+      symbol,
+      display: params.get('hyperDisplay') || symbol,
+      category: params.get('hyperCategory') || 'stock',
+    })
+    const cleanUrl = `${window.location.pathname}${window.location.hash}`
+    window.history.replaceState({}, '', cleanUrl)
+  }, [loading, language])
+
   const quickActions =
     language === 'zh'
       ? [
+          { label: '🇺🇸 创建美股Agent', cmd: '创建一个美股趋势交易 Agent，默认选择5个强势美股，严格风控' },
+          { label: '🗣 一句话策略', cmd: '我想做美股强趋势突破，帮我生成策略和Agent' },
           { label: '💼 持仓', cmd: '/positions' },
           { label: '💰 余额', cmd: '/balance' },
           { label: '📋 Traders', cmd: '/traders' },
@@ -588,6 +672,8 @@ export function AgentChatPage() {
           { label: '❓ 帮助', cmd: '/help' },
         ]
       : [
+          { label: '🇺🇸 Create US Stock Agent', cmd: 'Create a US stock trend-following agent with 5 strong stocks and strict risk control' },
+          { label: '🗣 One-line strategy', cmd: 'I want a US stock breakout strategy; build the strategy and agent' },
           { label: '💼 Positions', cmd: '/positions' },
           { label: '💰 Balance', cmd: '/balance' },
           { label: '📋 Traders', cmd: '/traders' },
@@ -602,6 +688,18 @@ export function AgentChatPage() {
       icon: <TrendingUp size={14} />,
       title: language === 'zh' ? '市场行情' : 'Market',
       component: <MarketTicker />,
+    },
+    {
+      key: 'hyperliquid' as const,
+      icon: <Zap size={14} />,
+      title: language === 'zh' ? '美股/全球标的' : 'US & Global Markets',
+      component: (
+        <HyperliquidSymbolsPanel
+          language={language}
+          disabled={loading}
+          onTradeSymbol={tradeHyperliquidSymbol}
+        />
+      ),
     },
     {
       key: 'positions' as const,
