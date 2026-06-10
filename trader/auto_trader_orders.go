@@ -53,7 +53,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actio
 	// Get current price
 	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get market data for %s: %w", decision.Symbol, err)
 	}
 
 	// Get balance (needed for multiple checks)
@@ -117,7 +117,7 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actio
 	// Open position
 	order, err := at.trader.OpenLong(decision.Symbol, quantity, decision.Leverage)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open long position for %s: %w", decision.Symbol, err)
 	}
 
 	// Record order ID
@@ -170,7 +170,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *kernel.Decision, acti
 	// Get current price
 	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get market data for %s: %w", decision.Symbol, err)
 	}
 
 	// Get balance (needed for multiple checks)
@@ -234,7 +234,7 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *kernel.Decision, acti
 	// Open position
 	order, err := at.trader.OpenShort(decision.Symbol, quantity, decision.Leverage)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open short position for %s: %w", decision.Symbol, err)
 	}
 
 	// Record order ID
@@ -269,7 +269,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *kernel.Decision, acti
 	// Get current price
 	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get market data for %s: %w", decision.Symbol, err)
 	}
 	actionRecord.Price = marketData.CurrentPrice
 
@@ -311,7 +311,7 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *kernel.Decision, acti
 	// Close position
 	order, err := at.trader.CloseLong(decision.Symbol, 0) // 0 = close all
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to close long position for %s: %w", decision.Symbol, err)
 	}
 
 	// Record order ID
@@ -333,7 +333,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *kernel.Decision, act
 	// Get current price
 	marketData, err := market.GetWithExchange(decision.Symbol, at.exchange)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get market data for %s: %w", decision.Symbol, err)
 	}
 	actionRecord.Price = marketData.CurrentPrice
 
@@ -375,7 +375,7 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *kernel.Decision, act
 	// Close position
 	order, err := at.trader.CloseShort(decision.Symbol, 0) // 0 = close all
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to close short position for %s: %w", decision.Symbol, err)
 	}
 
 	// Record order ID
