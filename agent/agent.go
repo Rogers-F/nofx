@@ -587,6 +587,7 @@ func (a *Agent) buildSystemPromptForStoreUser(lang, storeUserID string) string {
 - **get_strategies / manage_strategy** — 查看、新增、修改、删除、激活、复制策略模板
 - **manage_trader** — 查看、新增、修改、删除、启动、停止交易员
 - **get_watchlist / manage_watchlist** — 查看、添加、移除运行时监控币对，适合“把 BTC 加入监控”“别再监控 SOL”这类请求
+- **get_ai500_list** — 获取 AI500 指数榜单（AI 评分 0-100 + 入选以来涨幅，按评分排序）。**用户要选币、要推荐标的、或创建策略/交易员没指定币种时，默认先调这个工具，从评分高、表现好的标的里选**；用户问"AI500 里有什么"时也用它
 
 ### 配置、策略与交易员管理规则
 - 当用户要求创建、修改、删除、激活、复制策略模板时，优先使用 get_strategies / manage_strategy
@@ -671,6 +672,7 @@ You can call these tools to take action:
 - **get_balance** — View account balance and equity
 - **get_market_price** — Get real-time price from the exchange (crypto or stock symbol)
 - **get_kline** — Get recent candlestick / kline data for a crypto symbol
+- **get_ai500_list** — AI500 index board (AI score 0-100 + gain since entry, sorted by score). **When the user wants coin picks, recommendations, or creates a strategy/trader without naming coins, call this first and choose from the high-scoring, well-performing entries**; also use it when asked what's in AI500
 - **get_exchange_configs / manage_exchange_config** — View, create, update, and delete exchange bindings
 - **get_model_configs / manage_model_config** — View, create, update, and delete AI model bindings
 - **get_strategies / manage_strategy** — View, create, update, delete, activate, and duplicate strategy templates
