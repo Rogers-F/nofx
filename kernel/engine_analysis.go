@@ -117,9 +117,36 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 		return nil, fmt.Errorf("AI API call failed: %w", err)
 	}
 
+	// 4.5 Optional response normalization (additive, NOFX_NORMALIZER switch).
+	//     off (default): parseInput stays the raw response — behavior unchanged.
+	//     on: feed the normalized standard-format response to the parser.
+	//     shadow: compute + log the normalized response but still parse the raw.
+	parseInput := aiResponse
+	if mode := normalizerMode(); mode == normalizerOn || mode == normalizerShadow {
+		pool := make([]string, 0, len(ctx.CandidateCoins))
+		for _, c := range ctx.CandidateCoins {
+			pool = append(pool, c.Symbol)
+		}
+		priceMap := make(map[string]float64, len(ctx.MarketDataMap))
+		for sym, d := range ctx.MarketDataMap {
+			if d != nil && d.CurrentPrice > 0 {
+				priceMap[sym] = d.CurrentPrice
+			}
+		}
+		normalized, changed, reason := NormalizeAIResponse(aiResponse, pool, priceMap)
+		if mode == normalizerOn {
+			parseInput = normalized
+			logger.Infof("🔁 [Normalizer:on] changed=%v reason=%s raw=%s",
+				changed, reason, redactForLog(aiResponse))
+		} else {
+			logger.Infof("👻 [Normalizer:shadow] changed=%v reason=%s (raw still parsed) normalized=%s",
+				changed, reason, redactForLog(normalized))
+		}
+	}
+
 	// 5. Parse AI response
 	decision, err := parseFullDecisionResponse(
-		aiResponse,
+		parseInput,
 		ctx.Account.TotalEquity,
 		riskConfig.BTCETHMaxLeverage,
 		riskConfig.AltcoinMaxLeverage,
