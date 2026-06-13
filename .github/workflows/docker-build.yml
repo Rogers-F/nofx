@@ -8,6 +8,7 @@ on:
       - release/stable
     tags:
       - 'v*'
+      - '20*'
   pull_request:
     branches:
       - main
@@ -96,6 +97,7 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME && format('{0}/nofx-{1}', secrets.DOCKERHUB_USERNAME, matrix.image_suffix) || '' }}
           tags: |
             type=ref,event=branch,suffix=-${{ matrix.arch_tag }}
+            type=ref,event=tag,suffix=-${{ matrix.arch_tag }}
             type=semver,pattern={{version}},suffix=-${{ matrix.arch_tag }}
             type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.arch_tag }}
             type=semver,pattern={{major}},suffix=-${{ matrix.arch_tag }}
