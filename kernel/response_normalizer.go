@@ -33,6 +33,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -45,7 +46,19 @@ const (
 )
 
 // reSecretKV redacts obvious credential-looking key/value pairs before logging.
-var reSecretKV = regexp.MustCompile(`(?i)(authorization|api[-_]?key|secret|token|bearer|password)\s*[:=]\s*[^\s,"']+`)
+// The optional quotes tolerate JSON-style `"api_key":"..."` as well as
+// header/env style `api_key=...` / `authorization: ...`.
+var reSecretKV = regexp.MustCompile(`(?i)(authorization|api[-_]?key|secret|token|bearer|password)["']?\s*[:=]\s*["']?[^\s,"']+`)
+
+// reBearer redacts `Bearer <token>` (where the value is space-separated and
+// would otherwise slip past reSecretKV's no-whitespace value matcher).
+var reBearer = regexp.MustCompile(`(?i)bearer\s+[^\s,"']+`)
+
+// reJSONCodeFence captures the content of a ```json ... ``` code fence. The
+// mandatory whitespace after the "json" label pins the tag to exactly "json"
+// (a markdown info string ends at a newline), so neighbours like ```jsonc /
+// ```json5 / ```json_example can never outrank the real decision fence.
+var reJSONCodeFence = regexp.MustCompile(`(?is)` + "```json" + `\s(.*?)` + "```")
 
 // normalizerMode reads NOFX_NORMALIZER and returns a canonical mode. Any
 // unrecognized / empty value maps to "off" so the safe default is preserved.
@@ -63,6 +76,7 @@ func normalizerMode() string {
 // redactForLog masks credential-looking substrings and caps length so raw
 // model output can be logged without leaking secrets or flooding logs.
 func redactForLog(s string) string {
+	s = reBearer.ReplaceAllString(s, "bearer ***")
 	s = reSecretKV.ReplaceAllString(s, "$1=***")
 	const maxRunes = 1000
 	r := []rune(s)
@@ -91,22 +105,19 @@ func NormalizeAIResponse(raw string, candidatePool []string, currentPrice map[st
 
 	reasoning := extractReasoningText(raw)
 
-	// Decision JSON extraction priority:
-	//   a. inside <decision>...</decision>
-	//   b/c. first balanced, valid JSON value anywhere (covers ```json fences
-	//        and bare objects/arrays — the scanner ignores the surrounding
-	//        backticks and prose).
-	region := raw
-	if m := reDecisionTag.FindStringSubmatch(raw); m != nil && len(m) > 1 {
-		region = m[1]
-	}
-	frag, ok := findFirstJSON(region)
-	if !ok && region != raw {
-		frag, ok = findFirstJSON(raw)
-	}
+	frag, ok := pickJSONFragment(raw)
 	if !ok {
 		out := buildNormalized(reasoning, []Decision{waitDecision("ALL", reasoning, "no_json_found")})
 		return out, out != raw, "no_json_found"
+	}
+
+	// Duplicate same-name JSON keys (e.g. {"action":"NO_TRADE","action":"open_long"})
+	// are silently collapsed by encoding/json to the last value, hiding the
+	// conflict from lowerKeys/alias checks. On a money path that ambiguity must
+	// fail safe: any duplicate key anywhere in the fragment → all wait.
+	if hasDuplicateJSONKeys(frag) {
+		out := buildNormalized(reasoning, []Decision{waitDecision("ALL", reasoning, "duplicate_json_keys")})
+		return out, true, "duplicate_json_keys"
 	}
 
 	rawDecisions, code := extractRawDecisionObjects(frag)
@@ -147,11 +158,13 @@ func extractRawDecisionObjects(frag string) ([]map[string]interface{}, string) {
 
 	var obj map[string]interface{}
 	if err := json.Unmarshal(b, &obj); err == nil {
-		lo := lowerKeys(obj)
+		lo, _ := lowerKeys(obj)
 		if ordersRaw, present := lo["orders"]; present {
 			if list, isList := ordersRaw.([]interface{}); isList {
 				return toMaps(list), ""
 			}
+			// "orders" present but not an array: malformed envelope, fail safe.
+			return nil, "orders_not_array"
 		}
 		return []map[string]interface{}{obj}, ""
 	}
@@ -162,11 +175,28 @@ func extractRawDecisionObjects(frag string) ([]map[string]interface{}, string) {
 // normalizeOne maps one free-form decision object to a standard Decision,
 // downgrading to "wait" whenever any open-position safety gate is not met.
 func normalizeOne(rawObj map[string]interface{}, pool map[string]bool, price map[string]float64) Decision {
-	m := lowerKeys(rawObj)
+	m, conflicts := lowerKeys(rawObj)
 
 	symbol := firstStr(m, "symbol", "ticker")
 	reasoning := firstStr(m, "reasoning", "reason", "rationale")
-	dir := resolveDir(m)
+
+	// A case-variant conflict on any trading-critical field family is ambiguous
+	// — never fall back to an alias or treat the field as merely missing → wait.
+	if hasCriticalConflict(conflicts) {
+		return waitDecision(symbol, reasoning, "field_key_conflict")
+	}
+
+	// Same for alias-family conflicts: when two aliases of the same field appear
+	// with disagreeing values (e.g. symbol vs ticker, action vs decision, side
+	// vs direction, USD-size aliases), priority-picking the first would be a
+	// silent guess on a money path → wait instead.
+	for _, family := range aliasFamilies {
+		if familyValueConflict(m, family...) {
+			return waitDecision(symbol, reasoning, "field_alias_conflict")
+		}
+	}
+
+	dir, sidePresent := resolveSide(m)
 	action := normalizeAction(firstStr(m, "action", "decision", "signal"), dir)
 
 	confidence := 0
@@ -186,9 +216,25 @@ func normalizeOne(rawObj map[string]interface{}, pool map[string]bool, price map
 		return waitDecision(symbol, reasoning, "non_open_action")
 	}
 
-	// Open-position gates — ALL must hold, else downgrade to "wait".
-	// ② USD size only from the whitelist (position_size/size/qty/amount/quantity
-	//    are explicitly NOT treated as USD).
+	// Open-position gates — ALL must hold, else downgrade to "wait". Numbered in
+	// evaluation order.
+
+	// ① Direction must be unambiguous. If a side-like field is present, it must
+	// agree with the action's direction; a present-but-unresolved side ("flat",
+	// "not long", "long/short", ...) or a contradicting side is ambiguous → wait.
+	// An absent side is fine — the explicit open_* action is itself the directive.
+	if sidePresent {
+		want := "long"
+		if action == "open_short" {
+			want = "short"
+		}
+		if dir != want {
+			return waitDecision(symbol, reasoning, "ambiguous_or_conflicting_side")
+		}
+	}
+
+	// USD size only from the whitelist (position_size/size/qty/amount/quantity
+	// are explicitly NOT treated as USD).
 	posUSD, hasUSD := firstFloat(m, "position_size_usd", "notional_usd", "notional_usdt")
 	sl, hasSL := firstFloat(m, "stop_loss")
 	tp, hasTP := firstFloat(m, "take_profit")
@@ -197,21 +243,27 @@ func normalizeOne(rawObj map[string]interface{}, pool map[string]bool, price map
 		leverage = int(l + 0.5)
 	}
 
-	// ⑤ symbol must exactly match the candidate pool (no fuzzy completion).
+	// ② symbol must exactly match the candidate pool (no fuzzy completion).
 	if symbol == "" || !pool[symbol] {
 		return waitDecision(symbol, reasoning, "symbol_not_in_pool")
 	}
-	// ② USD field present and positive.
+	// ③ leverage is a required open field downstream (validateDecision errors on
+	// leverage<=0, which would fail the WHOLE parse, not just this decision);
+	// missing/zero leverage therefore fails the gate here → wait.
+	if leverage <= 0 {
+		return waitDecision(symbol, reasoning, "missing_leverage")
+	}
+	// ④ USD field present and positive.
 	if !hasUSD || posUSD <= 0 {
 		return waitDecision(symbol, reasoning, "missing_usd_size")
 	}
-	// ③ both stop-loss and take-profit present and positive.
+	// ⑤ both stop-loss and take-profit present and positive.
 	if !hasSL || !hasTP || sl <= 0 || tp <= 0 {
 		return waitDecision(symbol, reasoning, "missing_sl_tp")
 	}
-	// ④ price/direction consistency against the current price.
-	cur, ok := price[symbol]
-	if !ok || cur <= 0 {
+	// ⑥ price/direction consistency against the current price.
+	cur, priceOK := price[symbol]
+	if !priceOK || cur <= 0 {
 		return waitDecision(symbol, reasoning, "no_current_price")
 	}
 	if action == "open_long" && !(sl < cur && cur < tp) {
@@ -238,8 +290,7 @@ func normalizeOne(rawObj map[string]interface{}, pool map[string]bool, price map
 // "wait" — including bare LONG/SHORT/BUY/SELL/HOLD/NO_TRADE/FLAT.
 func normalizeAction(rawAction, dir string) string {
 	a := strings.ToLower(strings.TrimSpace(rawAction))
-	a = strings.ReplaceAll(a, "-", "_")
-	a = strings.ReplaceAll(a, " ", "_")
+	a = strings.NewReplacer("-", "_", " ", "_").Replace(a)
 	switch a {
 	case "open_long":
 		return "open_long"
@@ -262,17 +313,30 @@ func normalizeAction(rawAction, dir string) string {
 	}
 }
 
-// resolveDir extracts an explicit long/short direction from side-like fields.
-func resolveDir(m map[string]interface{}) string {
-	s := strings.ToLower(firstStr(m, "side", "direction", "position_side"))
-	switch {
-	case strings.Contains(s, "long"):
-		return "long"
-	case strings.Contains(s, "short"):
-		return "short"
-	default:
-		return ""
+// resolveSide extracts an EXPLICIT long/short direction from side-like fields.
+// Matching is exact (not substring) so ambiguous or negated values such as
+// "long/short", "not long", "avoid short", or "flat" resolve to dir="" while
+// reporting present=true — the caller treats a present-but-unresolved side as
+// ambiguous and downgrades to wait. present=false means no side field at all.
+func resolveSide(m map[string]interface{}) (dir string, present bool) {
+	for _, k := range []string{"side", "direction", "position_side"} {
+		v, ok := m[k]
+		if !ok {
+			continue
+		}
+		// The first side-like key that EXISTS is authoritative — its mere
+		// presence makes the field "present", even if empty/null/non-string.
+		if s, isStr := v.(string); isStr {
+			switch strings.ToLower(strings.TrimSpace(s)) {
+			case "long":
+				return "long", true
+			case "short":
+				return "short", true
+			}
+		}
+		return "", true // present but unresolved (empty, null, non-string, other)
 	}
+	return "", false
 }
 
 // waitDecision builds a fail-safe "wait" decision, preserving the symbol when
@@ -347,6 +411,88 @@ func extractReasoningText(raw string) string {
 // JSON scanning helpers
 // ============================================================================
 
+// pickJSONFragment selects the decision JSON fragment following the contract
+// priority, and — critically for a money path — does NOT scavenge unrelated
+// JSON when a higher-priority container exists:
+//
+//	a. inside <decision>...</decision> ONLY (no fallback to the whole text, so
+//	   prose / examples / watchlists outside the tag can never become orders);
+//	b. else inside the first ```json code fence that contains valid JSON (gives
+//	   fenced JSON priority over arbitrary prose JSON earlier in the text);
+//	c. else the first balanced, valid JSON value anywhere in the text.
+func pickJSONFragment(raw string) (string, bool) {
+	if m := reDecisionTag.FindStringSubmatch(raw); m != nil && len(m) > 1 {
+		return findFirstJSON(m[1])
+	}
+	for _, fm := range reJSONCodeFence.FindAllStringSubmatch(raw, -1) {
+		if len(fm) > 1 {
+			if frag, ok := findFirstJSON(fm[1]); ok {
+				return frag, true
+			}
+		}
+	}
+	return findFirstJSON(raw)
+}
+
+// hasDuplicateJSONKeys reports whether any object in the JSON fragment contains
+// the same key more than once. encoding/json would silently keep only the last
+// occurrence, so this is the only place such a conflict can be detected.
+func hasDuplicateJSONKeys(fragment string) bool {
+	dec := json.NewDecoder(strings.NewReader(fragment))
+	type frame struct {
+		object    bool
+		keys      map[string]bool
+		expectKey bool
+	}
+	var stack []*frame
+	markValueConsumed := func() {
+		if len(stack) > 0 {
+			if top := stack[len(stack)-1]; top.object {
+				top.expectKey = true
+			}
+		}
+	}
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			// io.EOF = clean end; any other error means malformed JSON, which
+			// the normal parse path turns into a fail-safe wait anyway. Either
+			// way, no duplicate key was found.
+			return false
+		}
+		switch t := tok.(type) {
+		case json.Delim:
+			switch t {
+			case '{':
+				stack = append(stack, &frame{object: true, keys: map[string]bool{}, expectKey: true})
+			case '[':
+				stack = append(stack, &frame{object: false})
+			case '}', ']':
+				if len(stack) > 0 {
+					stack = stack[:len(stack)-1]
+				}
+				markValueConsumed()
+			}
+		default:
+			if len(stack) == 0 {
+				continue
+			}
+			top := stack[len(stack)-1]
+			if top.object && top.expectKey {
+				if s, ok := tok.(string); ok {
+					if top.keys[s] {
+						return true
+					}
+					top.keys[s] = true
+				}
+				top.expectKey = false
+			} else if top.object {
+				top.expectKey = true
+			}
+		}
+	}
+}
+
 // findFirstJSON returns the first balanced, syntactically valid JSON value
 // (object or array) found in s.
 func findFirstJSON(s string) (string, bool) {
@@ -402,12 +548,102 @@ func matchBalanced(s string, start int) (string, bool) {
 // Field accessors (case-insensitive over lower-cased keys)
 // ============================================================================
 
-func lowerKeys(m map[string]interface{}) map[string]interface{} {
+// lowerKeys lower-cases keys for case-insensitive lookups, and reports which
+// lower-cased keys had a case-variant collision with DIFFERENT values (e.g.
+// {"side":"flat","Side":"short"}). Colliding keys are dropped from the map so a
+// reader never gets a non-deterministic winner from Go's map iteration order;
+// the returned conflict set lets callers refuse to act on an ambiguous field
+// rather than silently falling back to an alias.
+func lowerKeys(m map[string]interface{}) (map[string]interface{}, map[string]bool) {
 	out := make(map[string]interface{}, len(m))
+	conflicted := make(map[string]bool)
 	for k, v := range m {
-		out[strings.ToLower(strings.TrimSpace(k))] = v
+		lk := strings.ToLower(strings.TrimSpace(k))
+		if prev, exists := out[lk]; exists {
+			if !reflect.DeepEqual(prev, v) {
+				conflicted[lk] = true
+			}
+			continue
+		}
+		out[lk] = v
 	}
-	return out
+	for lk := range conflicted {
+		delete(out, lk)
+	}
+	return out, conflicted
+}
+
+// criticalConflictKeys are the lower-cased field families that drive a trading
+// decision. A case-variant conflict on ANY of them makes the decision
+// ambiguous on a money path, so it must collapse to wait rather than fall back
+// to an alias or be treated as "missing".
+var criticalConflictKeys = []string{
+	"action", "decision", "signal",
+	"symbol", "ticker",
+	"side", "direction", "position_side",
+	"position_size_usd", "notional_usd", "notional_usdt",
+	"stop_loss", "take_profit", "leverage",
+}
+
+func hasCriticalConflict(conflicts map[string]bool) bool {
+	for _, k := range criticalConflictKeys {
+		if conflicts[k] {
+			return true
+		}
+	}
+	return false
+}
+
+// aliasFamilies groups interchangeable field names. If two members of a family
+// are both present with disagreeing values, the decision is ambiguous → wait.
+var aliasFamilies = [][]string{
+	{"action", "decision", "signal"},
+	{"symbol", "ticker"},
+	{"side", "direction", "position_side"},
+	{"position_size_usd", "notional_usd", "notional_usdt"},
+}
+
+// familyValueConflict reports whether 2+ of the given keys are present with
+// values that do not all normalize equal. Comparison is conservative (a string
+// vs number, or any differing value, counts as a conflict) — safe for a money
+// path where a false "wait" is preferable to a guessed open.
+func familyValueConflict(m map[string]interface{}, keys ...string) bool {
+	first := ""
+	have := false
+	for _, k := range keys {
+		v, ok := m[k]
+		if !ok {
+			continue
+		}
+		key := valueCompareKey(v)
+		if !have {
+			first, have = key, true
+			continue
+		}
+		if key != first {
+			return true
+		}
+	}
+	return false
+}
+
+// valueCompareKey renders a JSON value into a normalized, type-tagged string for
+// equality comparison (case-insensitive for strings, canonical for numbers).
+func valueCompareKey(v interface{}) string {
+	switch n := v.(type) {
+	case string:
+		return "s:" + strings.ToLower(strings.TrimSpace(n))
+	case float64:
+		return "f:" + strconv.FormatFloat(n, 'g', -1, 64)
+	case json.Number:
+		return "f:" + n.String()
+	case bool:
+		return fmt.Sprintf("b:%v", n)
+	case nil:
+		return "null"
+	default:
+		return fmt.Sprintf("o:%v", n)
+	}
 }
 
 func firstStr(m map[string]interface{}, keys ...string) string {
