@@ -95,13 +95,15 @@ jobs:
           images: |
             ${{ env.REGISTRY_GHCR }}/${{ needs.prepare.outputs.image_base }}/nofx-${{ matrix.image_suffix }}
             ${{ secrets.DOCKERHUB_USERNAME && format('{0}/nofx-{1}', secrets.DOCKERHUB_USERNAME, matrix.image_suffix) || '' }}
+          flavor: |
+            latest=false
           tags: |
             type=ref,event=branch,suffix=-${{ matrix.arch_tag }}
             type=ref,event=tag,suffix=-${{ matrix.arch_tag }}
             type=semver,pattern={{version}},suffix=-${{ matrix.arch_tag }}
             type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.arch_tag }}
             type=semver,pattern={{major}},suffix=-${{ matrix.arch_tag }}
-            type=sha,prefix={{branch}}-,suffix=-${{ matrix.arch_tag }}
+            type=sha,prefix={{branch}}-,suffix=-${{ matrix.arch_tag }},enable=${{ github.ref_type == 'branch' }}
 
       - name: Build and push ${{ matrix.name }}-${{ matrix.arch_tag }} image
         uses: docker/build-push-action@v5
