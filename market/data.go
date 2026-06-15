@@ -141,11 +141,37 @@ func GetWithExchange(symbol, exchange string) (*Data, error) {
 	}, nil
 }
 
+// klineFetcher fetches `limit` klines for one symbol+interval from a specific
+// source. Injected into getWithTimeframes so a caller can choose CoinAnk (the
+// default for every strategy) or Binance-direct without duplicating the
+// multi-timeframe assembly logic.
+type klineFetcher func(symbol, interval string, limit int) ([]Kline, error)
+
+func coinAnkKlineFetcher(symbol, interval string, limit int) ([]Kline, error) {
+	return getKlinesFromCoinAnk(symbol, interval, "binance", limit)
+}
+
 // GetWithTimeframes retrieves market data for specified multiple timeframes
 // timeframes: list of timeframes, e.g. ["5m", "15m", "1h", "4h"]
 // primaryTimeframe: primary timeframe (used for calculating current indicators), defaults to timeframes[0]
 // count: number of K-lines for each timeframe
+// K-lines are sourced from CoinAnk (the default for every strategy).
 func GetWithTimeframes(symbol string, timeframes []string, primaryTimeframe string, count int) (*Data, error) {
+	return getWithTimeframes(symbol, timeframes, primaryTimeframe, count, coinAnkKlineFetcher)
+}
+
+// GetWithTimeframesBinance is identical to GetWithTimeframes but sources K-lines
+// directly from Binance USD-M Futures (fapi.binance.com), the venue where orders
+// execute. The GINA strategy uses this so its decision data and its fills share
+// one price source, removing the CoinAnk cross-source divergence observed on
+// thin/volatile symbols. There is no CoinAnk fallback: a Binance fetch failure
+// drops the symbol so GINA fails closed (waits) rather than trading on the
+// divergent source.
+func GetWithTimeframesBinance(symbol string, timeframes []string, primaryTimeframe string, count int) (*Data, error) {
+	return getWithTimeframes(symbol, timeframes, primaryTimeframe, count, getKlinesFromBinance)
+}
+
+func getWithTimeframes(symbol string, timeframes []string, primaryTimeframe string, count int, fetch klineFetcher) (*Data, error) {
 	symbol = Normalize(symbol)
 
 	if len(timeframes) == 0 {
@@ -189,10 +215,10 @@ func GetWithTimeframes(symbol string, timeframes []string, primaryTimeframe stri
 				continue
 			}
 		} else {
-			// Use CoinAnk for regular crypto assets (default to Binance)
-			klines, err = getKlinesFromCoinAnk(symbol, tf, "binance", 200)
+			// Source per the injected fetcher: CoinAnk (default) or Binance-direct (GINA).
+			klines, err = fetch(symbol, tf, 200)
 			if err != nil {
-				logger.Infof("⚠️ Failed to get %s %s K-line from CoinAnk: %v", symbol, tf, err)
+				logger.Infof("⚠️ Failed to get %s %s K-line: %v", symbol, tf, err)
 				continue
 			}
 		}

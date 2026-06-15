@@ -177,6 +177,14 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 // Market Data Fetching
 // ============================================================================
 
+// usesBinanceDirectKlines reports whether a strategy should source its market
+// K-lines straight from Binance (fapi.binance.com) instead of CoinAnk. Only GINA
+// does, so its decision data shares the exact venue where its orders execute and
+// avoids CoinAnk's cross-source price divergence on thin/volatile symbols.
+func usesBinanceDirectKlines(cfg *store.StrategyConfig) bool {
+	return cfg != nil && cfg.CoinSource.SourceType == "gina"
+}
+
 // fetchMarketDataWithStrategy fetches market data using strategy config (multiple timeframes)
 func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 	config := engine.GetConfig()
@@ -206,9 +214,22 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 
 	logger.Infof("📊 Strategy timeframes: %v, Primary: %s, Kline count: %d", timeframes, primaryTimeframe, klineCount)
 
+	// GINA executes on Binance, so source its K-lines directly from Binance
+	// (fapi.binance.com) rather than CoinAnk — decision data and fills then share
+	// one venue, removing the CoinAnk cross-source price divergence on thin/
+	// volatile symbols. Every other strategy keeps CoinAnk. A Binance fetch
+	// failure drops the symbol (fail-closed) with no CoinAnk fallback.
+	useBinanceKlines := usesBinanceDirectKlines(config)
+	fetchTimeframes := func(sym string) (*market.Data, error) {
+		if useBinanceKlines {
+			return market.GetWithTimeframesBinance(sym, timeframes, primaryTimeframe, klineCount)
+		}
+		return market.GetWithTimeframes(sym, timeframes, primaryTimeframe, klineCount)
+	}
+
 	// 1. First fetch data for position coins (must fetch)
 	for _, pos := range ctx.Positions {
-		data, err := market.GetWithTimeframes(pos.Symbol, timeframes, primaryTimeframe, klineCount)
+		data, err := fetchTimeframes(pos.Symbol)
 		if err != nil {
 			logger.Infof("⚠️  Failed to fetch market data for position %s: %v", pos.Symbol, err)
 			continue
@@ -229,7 +250,7 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 			continue
 		}
 
-		data, err := market.GetWithTimeframes(coin.Symbol, timeframes, primaryTimeframe, klineCount)
+		data, err := fetchTimeframes(coin.Symbol)
 		if err != nil {
 			logger.Infof("⚠️  Failed to fetch market data for %s: %v", coin.Symbol, err)
 			continue
