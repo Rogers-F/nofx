@@ -32,6 +32,7 @@ package kernel
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"reflect"
 	"regexp"
@@ -92,10 +93,13 @@ func redactForLog(s string) string {
 //	raw           : the model's raw content.
 //	candidatePool : symbols allowed to be opened this cycle (exact match only).
 //	currentPrice  : current price per symbol, used for price/direction checks.
+//	equity        : account equity in USDT, used only to convert a
+//	                percent-of-equity position size into a USD notional. Pass 0
+//	                when unknown — percent-based sizing then fails safe to wait.
 //
 // Returns the normalized standard-format string, whether it differs from the
 // raw input (changed), and a short reason code for logging.
-func NormalizeAIResponse(raw string, candidatePool []string, currentPrice map[string]float64) (normalized string, changed bool, reason string) {
+func NormalizeAIResponse(raw string, candidatePool []string, currentPrice map[string]float64, equity float64) (normalized string, changed bool, reason string) {
 	pool := make(map[string]bool, len(candidatePool))
 	for _, s := range candidatePool {
 		if t := strings.TrimSpace(s); t != "" {
@@ -133,7 +137,7 @@ func NormalizeAIResponse(raw string, candidatePool []string, currentPrice map[st
 	out := make([]Decision, 0, len(rawDecisions))
 	waitCount := 0
 	for _, rd := range rawDecisions {
-		d := normalizeOne(rd, pool, currentPrice)
+		d := normalizeOne(rd, pool, currentPrice, equity)
 		if d.Action == "wait" {
 			waitCount++
 		}
@@ -174,8 +178,11 @@ func extractRawDecisionObjects(frag string) ([]map[string]interface{}, string) {
 
 // normalizeOne maps one free-form decision object to a standard Decision,
 // downgrading to "wait" whenever any open-position safety gate is not met.
-func normalizeOne(rawObj map[string]interface{}, pool map[string]bool, price map[string]float64) Decision {
-	m, conflicts := lowerKeys(rawObj)
+func normalizeOne(rawObj map[string]interface{}, pool map[string]bool, price map[string]float64, equity float64) Decision {
+	// Flatten known wrapper objects (e.g. position_sizing{}, risk_management{})
+	// up to the top level so nested decisions are reachable; this also lower-cases
+	// keys and reports case/placement conflicts exactly like lowerKeys.
+	m, conflicts := flattenEnvelopes(rawObj)
 
 	symbol := firstStr(m, "symbol", "ticker")
 	reasoning := firstStr(m, "reasoning", "reason", "rationale")
@@ -233,11 +240,24 @@ func normalizeOne(rawObj map[string]interface{}, pool map[string]bool, price map
 		}
 	}
 
-	// USD size only from the whitelist (position_size/size/qty/amount/quantity
-	// are explicitly NOT treated as USD).
-	posUSD, hasUSD := firstFloat(m, "position_size_usd", "notional_usd", "notional_usdt")
-	sl, hasSL := firstFloat(m, "stop_loss")
-	tp, hasTP := firstFloat(m, "take_profit")
+	// USD size only from notional-denominated fields. Bare position_size/size/
+	// qty/amount/quantity AND margin-denominated fields are explicitly NOT
+	// treated as USD notional. If no USD notional is given, fall back to a
+	// percent-of-equity size (e.g. variant-style "position_size_pct_equity"),
+	// converted with the account equity.
+	posUSD, hasUSD := firstFloat(m, "position_size_usd", "notional_usd", "notional_usdt", "suggested_notional_usdt", "notional")
+	if !hasUSD {
+		if pct, ok := firstFloat(m, "position_size_pct_equity", "position_size_pct", "pct_equity"); ok && equity > 0 {
+			if usd := pctEquityToUSD(pct, equity); usd > 0 {
+				posUSD, hasUSD = usd, true
+			}
+		}
+	}
+	// Stop-loss / take-profit, tolerating common alias names. take_profit_2 is
+	// deliberately NOT an alias — when both TP1 and TP2 are given, TP1 (the
+	// nearest target) is used and TP2 ignored.
+	sl, hasSL := firstFloat(m, "stop_loss", "sl", "stop_price", "stoploss")
+	tp, hasTP := firstFloat(m, "take_profit", "take_profit_1", "tp", "tp1", "target_price", "takeprofit")
 	leverage := 0
 	if l, ok := firstFloat(m, "leverage"); ok {
 		leverage = int(l + 0.5)
@@ -573,6 +593,82 @@ func lowerKeys(m map[string]interface{}) (map[string]interface{}, map[string]boo
 	return out, conflicted
 }
 
+// envelopeKeys are wrapper sub-objects whose scalar entries are merged up to the
+// top level so nested decisions (e.g. position_sizing{}, risk_management{}) are
+// reachable by flat field extraction.
+var envelopeKeys = []string{
+	"position_sizing", "risk_management", "order", "trade",
+	"params", "parameters", "sizing", "risk", "decision_params",
+}
+
+// flattenEnvelopes lower-cases keys (like lowerKeys) and additionally merges the
+// scalar entries of known wrapper sub-objects up to the top level. Top-level
+// keys are authoritative; a key that appears in more than one place (top level
+// or any envelope) with DIFFERENT values is reported as a conflict and dropped,
+// so the caller fails safe rather than picking a silent winner. Deeper nesting
+// inside an envelope is ignored.
+func flattenEnvelopes(raw map[string]interface{}) (map[string]interface{}, map[string]bool) {
+	out := make(map[string]interface{}, len(raw))
+	conflicted := make(map[string]bool)
+	put := func(k string, v interface{}) {
+		lk := strings.ToLower(strings.TrimSpace(k))
+		if prev, exists := out[lk]; exists {
+			if !reflect.DeepEqual(prev, v) {
+				conflicted[lk] = true
+			}
+			return
+		}
+		out[lk] = v
+	}
+	envSet := make(map[string]bool, len(envelopeKeys))
+	for _, e := range envelopeKeys {
+		envSet[e] = true
+	}
+	// First pass: place top-level scalars (authoritative on collision) and
+	// collect envelope containers by their LOWER-CASED name, so case variants
+	// (e.g. "Position_Sizing") are not silently skipped.
+	var envContainers []map[string]interface{}
+	for k, v := range raw {
+		lk := strings.ToLower(strings.TrimSpace(k))
+		if envSet[lk] {
+			if subMap, isMap := v.(map[string]interface{}); isMap {
+				envContainers = append(envContainers, subMap)
+			}
+			continue // the container itself is never a usable field
+		}
+		put(k, v)
+	}
+	// Second pass: merge scalar entries from ALL envelope containers (including
+	// case variants). put() flags any per-key value disagreement as a conflict,
+	// so two containers that contradict each other cannot silently pick a winner.
+	for _, subMap := range envContainers {
+		for k, v := range subMap {
+			switch v.(type) {
+			case map[string]interface{}, []interface{}:
+				continue // ignore deeper nesting / arrays
+			}
+			put(k, v)
+		}
+	}
+	for lk := range conflicted {
+		delete(out, lk)
+	}
+	return out, conflicted
+}
+
+// pctEquityToUSD converts a percent-of-equity position size into a USD notional.
+// The value is ALWAYS read as a percentage and accepted only in the sane range
+// [1, 100] (e.g. 20 -> 20% of equity). Anything outside that range — including a
+// sub-1 value whose unit is ambiguous (0.5 could mean 0.5% or 50%) or an absurd
+// >100 — returns 0 so the caller fails safe to wait rather than guessing the
+// unit. Downstream risk control still applies the final position-size caps.
+func pctEquityToUSD(pct, equity float64) float64 {
+	if equity <= 0 || pct < 1 || pct > 100 {
+		return 0
+	}
+	return pct / 100 * equity
+}
+
 // criticalConflictKeys are the lower-cased field families that drive a trading
 // decision. A case-variant conflict on ANY of them makes the decision
 // ambiguous on a money path, so it must collapse to wait rather than fall back
@@ -581,8 +677,11 @@ var criticalConflictKeys = []string{
 	"action", "decision", "signal",
 	"symbol", "ticker",
 	"side", "direction", "position_side",
-	"position_size_usd", "notional_usd", "notional_usdt",
-	"stop_loss", "take_profit", "leverage",
+	"position_size_usd", "notional_usd", "notional_usdt", "suggested_notional_usdt", "notional",
+	"position_size_pct_equity", "position_size_pct", "pct_equity",
+	"stop_loss", "sl", "stop_price", "stoploss",
+	"take_profit", "take_profit_1", "tp", "tp1", "target_price", "takeprofit",
+	"leverage",
 }
 
 func hasCriticalConflict(conflicts map[string]bool) bool {
@@ -600,7 +699,10 @@ var aliasFamilies = [][]string{
 	{"action", "decision", "signal"},
 	{"symbol", "ticker"},
 	{"side", "direction", "position_side"},
-	{"position_size_usd", "notional_usd", "notional_usdt"},
+	{"position_size_usd", "notional_usd", "notional_usdt", "suggested_notional_usdt", "notional"},
+	{"position_size_pct_equity", "position_size_pct", "pct_equity"},
+	{"stop_loss", "sl", "stop_price", "stoploss"},
+	{"take_profit", "take_profit_1", "tp", "tp1", "target_price", "takeprofit"},
 }
 
 // familyValueConflict reports whether 2+ of the given keys are present with
@@ -660,6 +762,14 @@ func firstStr(m map[string]interface{}, keys ...string) string {
 }
 
 func firstFloat(m map[string]interface{}, keys ...string) (float64, bool) {
+	// finite rejects NaN/±Inf so a money-path number can never slip through a
+	// gate (e.g. "+Inf" parsed from a string would otherwise pass numeric checks).
+	finite := func(f float64) (float64, bool) {
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return 0, false
+		}
+		return f, true
+	}
 	for _, k := range keys {
 		v, ok := m[k]
 		if !ok {
@@ -667,16 +777,16 @@ func firstFloat(m map[string]interface{}, keys ...string) (float64, bool) {
 		}
 		switch n := v.(type) {
 		case float64:
-			return n, true
+			return finite(n)
 		case json.Number:
 			if f, err := n.Float64(); err == nil {
-				return f, true
+				return finite(f)
 			}
 		case int:
 			return float64(n), true
 		case string:
 			if f, err := strconv.ParseFloat(strings.TrimSpace(n), 64); err == nil {
-				return f, true
+				return finite(f)
 			}
 		}
 	}
