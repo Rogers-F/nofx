@@ -25,7 +25,7 @@ func TestNormalize_Sample1_NonUSDSizeMustWait(t *testing.T) {
 	pool := []string{"xyz:SNDK"}
 	price := map[string]float64{"xyz:SNDK": 2000.0} // between SL and TP — only the USD gate should fail
 
-	normalized, changed, _ := NormalizeAIResponse(raw, pool, price)
+	normalized, changed, _ := NormalizeAIResponse(raw, pool, price, 1000)
 	if !changed {
 		t.Fatalf("expected changed=true for free-form input")
 	}
@@ -45,7 +45,7 @@ func TestNormalize_Sample2_WatchlistNotOrders(t *testing.T) {
 	pool := []string{"xyz:SP500"}
 	price := map[string]float64{"xyz:SP500": 5000.0}
 
-	normalized, _, _ := NormalizeAIResponse(raw, pool, price)
+	normalized, _, _ := NormalizeAIResponse(raw, pool, price, 1000)
 	ds := parseNormalized(t, normalized)
 	if len(ds) != 1 {
 		t.Fatalf("expected 1 decision, got %d: %+v", len(ds), ds)
@@ -81,7 +81,7 @@ func TestNormalize_Sample3_ActionVariants(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			normalized, _, _ := NormalizeAIResponse(tc.raw, pool, price)
+			normalized, _, _ := NormalizeAIResponse(tc.raw, pool, price, 1000)
 			ds := parseNormalized(t, normalized)
 			if len(ds) != 1 {
 				t.Fatalf("expected 1 decision, got %d: %+v", len(ds), ds)
@@ -114,7 +114,7 @@ func TestNormalize_PriceDirectionMismatch(t *testing.T) {
 	pool := []string{"BTCUSDT"}
 	price := map[string]float64{"BTCUSDT": 100000.0}
 
-	normalized, _, _ := NormalizeAIResponse(raw, pool, price)
+	normalized, _, _ := NormalizeAIResponse(raw, pool, price, 1000)
 	ds := parseNormalized(t, normalized)
 	if len(ds) != 1 || ds[0].Action != "wait" {
 		t.Fatalf("inverted SL/TP must be wait, got %+v", ds)
@@ -127,7 +127,7 @@ func TestNormalize_SymbolNotInPool(t *testing.T) {
 	pool := []string{"BTCUSDT"}
 	price := map[string]float64{"DOGEUSDT": 0.2}
 
-	normalized, _, _ := NormalizeAIResponse(raw, pool, price)
+	normalized, _, _ := NormalizeAIResponse(raw, pool, price, 1000)
 	ds := parseNormalized(t, normalized)
 	if len(ds) != 1 || ds[0].Action != "wait" {
 		t.Fatalf("out-of-pool symbol must be wait, got %+v", ds)
@@ -160,7 +160,7 @@ func TestNormalize_ExtractionPaths(t *testing.T) {
 // No JSON anywhere → overall fail-safe wait.
 func TestNormalize_NoJSON_FailSafeWait(t *testing.T) {
 	raw := "I considered the market but decided to provide only prose, no JSON."
-	normalized, _, reason := NormalizeAIResponse(raw, []string{"BTCUSDT"}, map[string]float64{"BTCUSDT": 100000})
+	normalized, _, reason := NormalizeAIResponse(raw, []string{"BTCUSDT"}, map[string]float64{"BTCUSDT": 100000}, 1000)
 	if reason != "no_json_found" {
 		t.Fatalf("reason = %q, want no_json_found", reason)
 	}
@@ -172,7 +172,7 @@ func TestNormalize_NoJSON_FailSafeWait(t *testing.T) {
 
 func mustNormalize(t *testing.T, raw string, pool []string, price map[string]float64) string {
 	t.Helper()
-	n, _, _ := NormalizeAIResponse(raw, pool, price)
+	n, _, _ := NormalizeAIResponse(raw, pool, price, 1000)
 	return n
 }
 
@@ -308,6 +308,99 @@ func TestNormalize_ActionConflictBeatsAlias(t *testing.T) {
 // A conflicting symbol family must not fall back to ticker.
 func TestNormalize_SymbolConflictBeatsTicker(t *testing.T) {
 	raw := `{"action":"open_long","symbol":"BTCUSDT","Symbol":"ETHUSDT","ticker":"BTCUSDT","side":"long","notional_usd":200,"leverage":3,"stop_loss":90000,"take_profit":110000}`
+	assertSingleAction(t, raw, "wait")
+}
+
+// ---------------------------------------------------------------------------
+// variant-style schema: decision/take_profit_1/position_size_pct_equity and nested
+// position_sizing{}/risk_management{} envelopes.
+// ---------------------------------------------------------------------------
+
+// Flat variant schema: decision verb, take_profit_1 (with an ignored take_profit_2),
+// and percent-of-equity sizing converted with equity → open_long.
+func TestNormalize_VariantFlatSchemaOpens(t *testing.T) {
+	raw := `{"decision":"OPEN_LONG","symbol":"BTCUSDT","leverage":2,"stop_loss":90000,"take_profit_1":110000,"take_profit_2":115000,"position_size_pct_equity":20,"confidence":0.62}`
+	ds := parseNormalized(t, mustNormalize(t, raw, hardenPool, hardenPrice))
+	if len(ds) != 1 || ds[0].Action != "open_long" {
+		t.Fatalf("expected open_long from variant flat schema, got %+v", ds)
+	}
+	if ds[0].TakeProfit != 110000 {
+		t.Fatalf("expected take_profit_1 used as take_profit, got %v", ds[0].TakeProfit)
+	}
+	if ds[0].PositionSizeUSD != 200 { // 20% of equity 1000
+		t.Fatalf("expected 200 USD from 20%% of 1000 equity, got %v", ds[0].PositionSizeUSD)
+	}
+}
+
+// Nested variant schema: leverage/notional inside position_sizing{}, sl/tp inside
+// risk_management{} → flattened → open_long.
+func TestNormalize_VariantNestedEnvelopeOpens(t *testing.T) {
+	raw := `{"decision":"OPEN_LONG","symbol":"BTCUSDT","confidence":0.68,` +
+		`"position_sizing":{"suggested_notional_usdt":200,"leverage":3},` +
+		`"risk_management":{"stop_loss":90000,"take_profit_1":110000}}`
+	ds := parseNormalized(t, mustNormalize(t, raw, hardenPool, hardenPrice))
+	if len(ds) != 1 || ds[0].Action != "open_long" {
+		t.Fatalf("expected open_long from nested envelope, got %+v", ds)
+	}
+	if ds[0].PositionSizeUSD != 200 || ds[0].Leverage != 3 {
+		t.Fatalf("nested notional/leverage not extracted, got %+v", ds[0])
+	}
+}
+
+// Percent-of-equity sizing with NO equity available cannot be converted → wait.
+func TestNormalize_VariantPctSizeNoEquityMustWait(t *testing.T) {
+	raw := `{"decision":"OPEN_LONG","symbol":"BTCUSDT","leverage":2,"stop_loss":90000,"take_profit_1":110000,"position_size_pct_equity":20}`
+	n, _, _ := NormalizeAIResponse(raw, hardenPool, hardenPrice, 0)
+	ds := parseNormalized(t, n)
+	if len(ds) != 1 || ds[0].Action != "wait" {
+		t.Fatalf("pct size without equity must wait, got %+v", ds)
+	}
+}
+
+// A margin-denominated field must NEVER be treated as a USD notional size →
+// without a real notional/pct the open fails safe to wait.
+func TestNormalize_VariantMarginNotTreatedAsSize(t *testing.T) {
+	raw := `{"decision":"OPEN_LONG","symbol":"BTCUSDT","leverage":3,"stop_loss":90000,"take_profit":110000,"suggested_margin_usdt":50}`
+	assertSingleAction(t, raw, "wait")
+}
+
+// A leverage that disagrees between the top level and a nested envelope is
+// ambiguous → wait (the flatten conflict must not silently pick one).
+func TestNormalize_VariantNestedLeverageConflictMustWait(t *testing.T) {
+	raw := `{"decision":"OPEN_LONG","symbol":"BTCUSDT","leverage":5,"stop_loss":90000,"take_profit":110000,"notional_usd":200,"position_sizing":{"leverage":3}}`
+	assertSingleAction(t, raw, "wait")
+}
+
+// Percent sizing outside the sane [1,100] range is unit-ambiguous (0.5 could be
+// 0.5% or 50%) or absurd (>100) → not converted → wait.
+func TestNormalize_VariantPctSizeOutOfRangeMustWait(t *testing.T) {
+	for _, pct := range []string{"0.5", "0", "150"} {
+		raw := `{"decision":"OPEN_LONG","symbol":"BTCUSDT","leverage":2,"stop_loss":90000,"take_profit_1":110000,"position_size_pct_equity":` + pct + `}`
+		ds := parseNormalized(t, mustNormalize(t, raw, hardenPool, hardenPrice))
+		if len(ds) != 1 || ds[0].Action != "wait" {
+			t.Fatalf("pct=%s out of range must wait, got %+v", pct, ds)
+		}
+	}
+}
+
+// NaN / Inf numeric strings must never pass a money-path numeric gate → wait.
+func TestNormalize_NaNInfMustWait(t *testing.T) {
+	raws := []string{
+		`{"action":"open_long","symbol":"BTCUSDT","leverage":3,"notional_usd":200,"stop_loss":"NaN","take_profit":110000}`,
+		`{"action":"open_long","symbol":"BTCUSDT","leverage":3,"notional_usd":"+Inf","stop_loss":90000,"take_profit":110000}`,
+		`{"decision":"OPEN_LONG","symbol":"BTCUSDT","leverage":2,"stop_loss":90000,"take_profit_1":110000,"position_size_pct_equity":"+Inf"}`,
+	}
+	for _, raw := range raws {
+		assertSingleAction(t, raw, "wait")
+	}
+}
+
+// Two case-variant envelope containers that disagree must not silently pick one
+// → the per-key conflict forces wait.
+func TestNormalize_VariantEnvelopeCaseConflictMustWait(t *testing.T) {
+	raw := `{"decision":"OPEN_LONG","symbol":"BTCUSDT","stop_loss":90000,"take_profit":110000,` +
+		`"position_sizing":{"leverage":3,"notional_usd":200},` +
+		`"Position_Sizing":{"leverage":5,"notional_usd":200}}`
 	assertSingleAction(t, raw, "wait")
 }
 

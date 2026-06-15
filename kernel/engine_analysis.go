@@ -133,7 +133,7 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 				priceMap[sym] = d.CurrentPrice
 			}
 		}
-		normalized, changed, reason := NormalizeAIResponse(aiResponse, pool, priceMap)
+		normalized, changed, reason := NormalizeAIResponse(aiResponse, pool, priceMap, ctx.Account.TotalEquity)
 		if mode == normalizerOn {
 			parseInput = normalized
 			logger.Infof("🔁 [Normalizer:on] changed=%v reason=%s raw=%s",
