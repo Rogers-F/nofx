@@ -258,11 +258,11 @@ func GetRecentChangePct(symbol, interval string) (float64, error) {
 		return 0, fmt.Errorf("insufficient klines for %s %s", symbol, interval)
 	}
 
-	prev, err := parseKline(raw[len(raw)-2])
+	prev, err := parseBinanceKline(raw[len(raw)-2])
 	if err != nil {
 		return 0, err
 	}
-	last, err := parseKline(raw[len(raw)-1])
+	last, err := parseBinanceKline(raw[len(raw)-1])
 	if err != nil {
 		return 0, err
 	}

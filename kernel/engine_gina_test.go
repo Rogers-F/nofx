@@ -27,6 +27,26 @@ func oneMinData(price, slopeClosed, accelClosed, fundingPrev, fundingChange floa
 	}
 }
 
+func TestUsesBinanceDirectKlines(t *testing.T) {
+	gina := &store.StrategyConfig{}
+	gina.CoinSource.SourceType = "gina"
+	if !usesBinanceDirectKlines(gina) {
+		t.Fatal("gina strategy must source K-lines directly from Binance")
+	}
+	// Every other source keeps CoinAnk — Binance-direct must be GINA-only so this
+	// change cannot regress any other strategy's data path.
+	for _, src := range []string{"static", "ai500", "oi_top", "oi_low", "hyper_rank", "hyper_all", ""} {
+		other := &store.StrategyConfig{}
+		other.CoinSource.SourceType = src
+		if usesBinanceDirectKlines(other) {
+			t.Fatalf("source %q must keep CoinAnk K-lines", src)
+		}
+	}
+	if usesBinanceDirectKlines(nil) {
+		t.Fatal("nil config must not select Binance-direct K-lines")
+	}
+}
+
 func TestSelectGinaCandidates_DedupCapDirection(t *testing.T) {
 	declines := []ginaScored{
 		{"AAAUSDT", -9}, {"BBBUSDT", -5}, {"CCCUSDT", -1},
