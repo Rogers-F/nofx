@@ -13,6 +13,14 @@ type Data struct {
 	CurrentRSI7       float64
 	OpenInterest      *OIData
 	FundingRate       float64
+	// Funding rate change between the two most recent settled funding periods
+	// (Binance settles every 8h). FundingRateChange = FundingRate(latest) - FundingRate(prev).
+	// FundingStale is true when fewer than two settled records were available.
+	FundingRatePrev   float64
+	FundingRateChange float64
+	FundingTime       int64 // settlement time (ms) of the latest settled funding rate
+	NextFundingTime   int64 // next scheduled settlement time (ms), 0 if unknown
+	FundingStale      bool
 	IntradaySeries    *IntradayData
 	LongerTermContext *LongerTermData
 	// Multi-timeframe data (new)
@@ -45,6 +53,12 @@ type TimeframeSeriesData struct {
 	BOLLUpper  []float64 `json:"boll_upper"`  // Upper band
 	BOLLMiddle []float64 `json:"boll_middle"` // Middle band (SMA)
 	BOLLLower  []float64 `json:"boll_lower"`  // Lower band
+	// Middle-band momentum, normalized as a percentage of the middle band so it is
+	// comparable across symbols of different price scales. Computed from closed
+	// candles only. Slope[i] = (Middle[i]-Middle[i-1]) / Middle[i-1] * 100;
+	// Accel[i] = Slope[i] - Slope[i-1].
+	BOLLMiddleSlope []float64 `json:"boll_middle_slope"`
+	BOLLMiddleAccel []float64 `json:"boll_middle_accel"`
 }
 
 // OIData Open Interest data

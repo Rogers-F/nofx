@@ -177,6 +177,15 @@ type AutoTrader struct {
 	consecutiveAIFailures int                // Consecutive AI call failures
 	safeMode              bool               // Safe mode: no new positions, protect existing ones
 	safeModeReason        string             // Why safe mode was activated
+	// protectionHalt is a persistent block on opening new positions, raised when
+	// a freshly opened position could not be protected by a confirmed stop-loss
+	// and had to be rolled back. Unlike safeMode (an AI-failure circuit breaker
+	// that auto-clears when the model recovers), this halt is not auto-cleared;
+	// it stays until an operator/maintenance path resets it. Close and
+	// maintenance actions remain allowed while it is set.
+	protectionHalt       bool         // Persistent open-block after a stop-loss protection failure
+	protectionHaltReason string       // Why the protection halt was raised
+	protectionHaltMu     sync.RWMutex // Guards protectionHalt / protectionHaltReason
 }
 
 // NewAutoTrader creates an automatic trader

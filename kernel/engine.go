@@ -54,6 +54,16 @@ type AccountInfo struct {
 type CandidateCoin struct {
 	Symbol  string   `json:"symbol"`
 	Sources []string `json:"sources"` // Sources: "ai500" and/or "oi_top"
+	// Side is the allowed entry direction for sources that pick coins
+	// directionally (currently the GINA source: "long" for oversold,
+	// "short" for overbought). Empty means no directional constraint.
+	// The execution gate uses this to reject reverse entries; it never
+	// restricts closing an existing position.
+	Side string `json:"side,omitempty"`
+	// Reason is a short human-readable note on why the coin was selected.
+	Reason string `json:"reason,omitempty"`
+	// DataTimestamp is when the selection data was captured (ms).
+	DataTimestamp int64 `json:"data_timestamp,omitempty"`
 }
 
 // OITopData open interest growth top data (for AI decision reference)
@@ -387,6 +397,13 @@ func (e *StrategyEngine) GetCandidateCoins() ([]CandidateCoin, error) {
 
 	case "hyper_rank":
 		coins, err := e.getHyperRankCoins(coinSource.HyperRankCategory, coinSource.HyperRankDirection, coinSource.HyperRankLimit)
+		if err != nil {
+			return nil, err
+		}
+		return e.filterExcludedCoins(coins), nil
+
+	case "gina":
+		coins, err := e.getGinaCoins(coinSource.GinaVolumeTopN, coinSource.GinaPriceTopN)
 		if err != nil {
 			return nil, err
 		}

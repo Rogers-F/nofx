@@ -234,6 +234,10 @@ func calculateTimeframeSeries(klines []Kline, timeframe string, count int) *Time
 	// Calculate ATR14
 	data.ATR14 = calculateATR(klines, 14)
 
+	// Derive normalized middle-band slope and acceleration from the BOLL middle
+	// series (aligned with BOLLMiddle).
+	data.BOLLMiddleSlope, data.BOLLMiddleAccel = calculateBOLLMiddleMomentum(data.BOLLMiddle)
+
 	return data
 }
 

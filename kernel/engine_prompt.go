@@ -801,6 +801,16 @@ func (e *StrategyEngine) formatMarketData(data *market.Data) string {
 
 		if indicators.EnableFundingRate {
 			sb.WriteString(fmt.Sprintf("Funding Rate: %.2e\n\n", data.FundingRate))
+			// Settled funding-rate change. Binance settles every 8h, so this is a
+			// discrete 8h-cadence signal — not a per-minute one.
+			if data.FundingTime > 0 {
+				staleNote := ""
+				if data.FundingStale {
+					staleNote = " (STALE: latest settlement is old; do not treat as a fresh signal)"
+				}
+				sb.WriteString(fmt.Sprintf("Funding Rate Change (settled, 8h cadence): prev = %.2e, latest = %.2e, change = %.2e%s\n\n",
+					data.FundingRatePrev, data.FundingRatePrev+data.FundingRateChange, data.FundingRateChange, staleNote))
+			}
 		}
 	}
 
@@ -930,6 +940,15 @@ func (e *StrategyEngine) formatTimeframeSeriesData(sb *strings.Builder, data *ma
 		sb.WriteString(fmt.Sprintf("BOLL Upper: %s\n", formatFloatSlice(data.BOLLUpper)))
 		sb.WriteString(fmt.Sprintf("BOLL Middle: %s\n", formatFloatSlice(data.BOLLMiddle)))
 		sb.WriteString(fmt.Sprintf("BOLL Lower: %s\n", formatFloatSlice(data.BOLLLower)))
+		// Normalized middle-band momentum (% of middle band). The last value may
+		// be from a forming candle; the slope sign and acceleration drive
+		// momentum-based entries/exits.
+		if len(data.BOLLMiddleSlope) > 0 {
+			sb.WriteString(fmt.Sprintf("BOLL Middle Slope %%: %s\n", formatFloatSlice(data.BOLLMiddleSlope)))
+		}
+		if len(data.BOLLMiddleAccel) > 0 {
+			sb.WriteString(fmt.Sprintf("BOLL Middle Accel %%: %s\n", formatFloatSlice(data.BOLLMiddleAccel)))
+		}
 	}
 
 	sb.WriteString("\n")

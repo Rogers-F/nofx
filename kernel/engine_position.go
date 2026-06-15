@@ -101,33 +101,201 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 			}
 		}
 
-		var entryPrice float64
-		if d.Action == "open_long" {
-			entryPrice = d.StopLoss + (d.TakeProfit-d.StopLoss)*0.2
-		} else {
-			entryPrice = d.StopLoss - (d.StopLoss-d.TakeProfit)*0.2
-		}
-
-		var riskPercent, rewardPercent, riskRewardRatio float64
-		if d.Action == "open_long" {
-			riskPercent = (entryPrice - d.StopLoss) / entryPrice * 100
-			rewardPercent = (d.TakeProfit - entryPrice) / entryPrice * 100
-			if riskPercent > 0 {
-				riskRewardRatio = rewardPercent / riskPercent
-			}
-		} else {
-			riskPercent = (d.StopLoss - entryPrice) / entryPrice * 100
-			rewardPercent = (entryPrice - d.TakeProfit) / entryPrice * 100
-			if riskPercent > 0 {
-				riskRewardRatio = rewardPercent / riskPercent
-			}
-		}
-
-		if riskRewardRatio < 3.0 {
-			return fmt.Errorf("risk/reward ratio too low (%.2f:1), must be ≥3.0:1 [risk: %.2f%% reward: %.2f%%] [stop loss: %.2f take profit: %.2f]",
-				riskRewardRatio, riskPercent, rewardPercent, d.StopLoss, d.TakeProfit)
-		}
+		// Risk/reward is enforced downstream in PostValidateDecisions using the
+		// real current price. The previous check synthesized an entry price from
+		// stop-loss/take-profit, which yielded a constant ratio and never
+		// rejected anything.
 	}
 
 	return nil
+}
+
+// defaultMinRiskReward is the fallback minimum risk/reward ratio used when the
+// strategy config does not specify one. Matches the historical default.
+const defaultMinRiskReward = 3.0
+
+// PostValidateDecisions applies price-aware checks that the stateless parser
+// cannot: a real risk/reward gate (all strategies) and, for the GINA source in
+// hard mode, the directional/entry gate plus exit enforcement. It returns the
+// (possibly modified) decision slice — non-compliant opens are downgraded to
+// "wait" and GINA exits are appended; closing and maintenance actions are never
+// blocked.
+//
+// IMPORTANT: call this AFTER symbol canonicalization (the strategy-universe
+// filter), so decision symbols match ctx.MarketDataMap / candidate keys. For
+// non-GINA strategies, a decision whose price cannot be resolved is left
+// untouched (preserving legacy behavior); only GINA hard mode fails closed,
+// because its entry signal is mandatory.
+func PostValidateDecisions(ctx *Context, engine *StrategyEngine, decisions []Decision) []Decision {
+	if ctx == nil || engine == nil || len(decisions) == 0 {
+		return decisions
+	}
+	cfg := engine.GetConfig()
+	minRR := cfg.RiskControl.MinRiskRewardRatio
+	if minRR <= 0 {
+		minRR = defaultMinRiskReward
+	}
+	ginaHard := cfg.CoinSource.SourceType == "gina" && !cfg.CoinSource.GinaSoftMode
+
+	// Gate rationale: non-compliant opens are downgraded to "wait" rather than
+	// erroring the whole batch (as validateDecisions does for hard violations).
+	// This preserves valid close/hold actions in the same cycle and lets the
+	// model only ever be more conservative — it can wait, resize, or close, but
+	// the GINA direction/entry rules cannot be overridden into a new open.
+	var sideBySym map[string]string
+	if ginaHard {
+		sideBySym = make(map[string]string)
+		for _, c := range ctx.CandidateCoins {
+			if c.Side != "" {
+				sideBySym[c.Symbol] = c.Side
+			}
+		}
+	}
+
+	for i := range decisions {
+		d := &decisions[i]
+		if d.Action != "open_long" && d.Action != "open_short" {
+			continue
+		}
+		data := resolveMarketData(ctx, d.Symbol)
+		if data == nil || data.CurrentPrice <= 0 {
+			// GINA needs the price+signal; fail closed. Other strategies keep
+			// their legacy behavior (no real R/R was enforced before), so leave
+			// the decision untouched for downstream handling.
+			if ginaHard {
+				downgradeToWait(d, "no current price available for GINA gate (fail-closed)")
+			}
+			continue
+		}
+
+		if ok, reason := enforceRiskRewardWithPrice(d, data, minRR); !ok {
+			downgradeToWait(d, reason)
+			continue
+		}
+
+		if ginaHard {
+			wantSide := "long"
+			if d.Action == "open_short" {
+				wantSide = "short"
+			}
+			candSide := ginaCandidateSide(sideBySym, d.Symbol)
+			if candSide != wantSide {
+				downgradeToWait(d, fmt.Sprintf("gina: %s not allowed for %s (candidate side=%q)", d.Action, d.Symbol, candSide))
+				continue
+			}
+			if !ginaEntrySatisfied(wantSide, data) {
+				downgradeToWait(d, fmt.Sprintf("gina: entry conditions not satisfied for %s %s", wantSide, d.Symbol))
+				continue
+			}
+		}
+	}
+
+	if ginaHard {
+		decisions = injectGinaExits(ctx, decisions)
+	}
+	return decisions
+}
+
+// resolveMarketData looks up market data by symbol, falling back to the
+// normalized form so minor symbol variants still resolve.
+func resolveMarketData(ctx *Context, symbol string) *market.Data {
+	if d := ctx.MarketDataMap[symbol]; d != nil {
+		return d
+	}
+	return ctx.MarketDataMap[market.Normalize(symbol)]
+}
+
+// ginaCandidateSide returns the allowed side for a symbol from the candidate
+// map, trying the normalized form as a fallback. Empty when not a candidate.
+func ginaCandidateSide(sideBySym map[string]string, symbol string) string {
+	if s, ok := sideBySym[symbol]; ok {
+		return s
+	}
+	return sideBySym[market.Normalize(symbol)]
+}
+
+// enforceRiskRewardWithPrice validates an open decision's risk/reward using the
+// real current price. Fails closed when price is unavailable.
+func enforceRiskRewardWithPrice(d *Decision, data *market.Data, minRR float64) (bool, string) {
+	if data == nil || data.CurrentPrice <= 0 {
+		return false, "no current price available for risk/reward check (fail-closed)"
+	}
+	if d.StopLoss <= 0 || d.TakeProfit <= 0 {
+		return false, "missing stop-loss/take-profit"
+	}
+	entry := data.CurrentPrice
+	var risk, reward float64
+	if d.Action == "open_long" {
+		risk = entry - d.StopLoss
+		reward = d.TakeProfit - entry
+	} else {
+		risk = d.StopLoss - entry
+		reward = entry - d.TakeProfit
+	}
+	if risk <= 0 {
+		return false, fmt.Sprintf("stop-loss not protective at current price %.6f", entry)
+	}
+	if reward <= 0 {
+		return false, fmt.Sprintf("take-profit beyond current price %.6f", entry)
+	}
+	ratio := reward / risk
+	if ratio < minRR {
+		return false, fmt.Sprintf("risk/reward %.2f:1 below minimum %.2f:1 (entry %.6f sl %.6f tp %.6f)",
+			ratio, minRR, entry, d.StopLoss, d.TakeProfit)
+	}
+	return true, ""
+}
+
+// downgradeToWait turns a rejected open decision into a no-op wait, preserving an
+// audit trail in the reasoning and clearing the now-irrelevant open parameters.
+func downgradeToWait(d *Decision, reason string) {
+	logger.Infof("⛔ Downgrading %s %s to wait: %s", d.Action, d.Symbol, reason)
+	d.Action = "wait"
+	if d.Reasoning != "" {
+		d.Reasoning += " | "
+	}
+	d.Reasoning += "[gate] " + reason
+	d.Leverage = 0
+	d.PositionSizeUSD = 0
+	d.StopLoss = 0
+	d.TakeProfit = 0
+}
+
+// injectGinaExits appends close decisions for held positions whose GINA exit
+// conditions are satisfied but that the model did not already close. Returns the
+// (possibly extended) decision slice.
+func injectGinaExits(ctx *Context, decisions []Decision) []Decision {
+	closing := make(map[string]bool)
+	for _, d := range decisions {
+		switch d.Action {
+		case "close_long":
+			closing[d.Symbol+"_long"] = true
+		case "close_short":
+			closing[d.Symbol+"_short"] = true
+		}
+	}
+
+	for _, pos := range ctx.Positions {
+		if pos.Side != "long" && pos.Side != "short" {
+			continue
+		}
+		data := resolveMarketData(ctx, pos.Symbol)
+		if data == nil || !ginaExitSatisfied(pos.Side, data) {
+			continue
+		}
+		if closing[pos.Symbol+"_"+pos.Side] {
+			continue
+		}
+		action := "close_long"
+		if pos.Side == "short" {
+			action = "close_short"
+		}
+		logger.Infof("🚪 GINA exit triggered for %s %s — injecting %s", pos.Symbol, pos.Side, action)
+		decisions = append(decisions, Decision{
+			Symbol:    pos.Symbol,
+			Action:    action,
+			Reasoning: "[gina] exit conditions satisfied (funding reversal + middle-band momentum reversal)",
+		})
+	}
+	return decisions
 }
