@@ -30,6 +30,9 @@ const (
 	MaxPositionSize   = 1000.0
 	MinConfidence     = 50
 	MaxConfidence     = 100
+	// MaxGinaVolumeTopN bounds the 24h volume pre-filter universe for the GINA
+	// source to keep per-cycle exchange API weight in check.
+	MaxGinaVolumeTopN = 50
 )
 
 // ClampLimits enforces product-level limits on strategy config to prevent token overflow.
@@ -45,6 +48,16 @@ func (c *StrategyConfig) ClampLimits() {
 	}
 	if c.CoinSource.OILowLimit > MaxCandidateCoins {
 		c.CoinSource.OILowLimit = MaxCandidateCoins
+	}
+
+	// Clamp GINA source limits. GinaVolumeTopN is the volume pre-filter universe
+	// (kept modest to bound exchange API weight); GinaPriceTopN is per-direction
+	// and the combined long+short list is hard capped at MaxCandidateCoins.
+	if c.CoinSource.GinaVolumeTopN > MaxGinaVolumeTopN {
+		c.CoinSource.GinaVolumeTopN = MaxGinaVolumeTopN
+	}
+	if c.CoinSource.GinaPriceTopN > MaxCandidateCoins {
+		c.CoinSource.GinaPriceTopN = MaxCandidateCoins
 	}
 
 	// Clamp static coins
@@ -205,6 +218,18 @@ func (c *StrategyConfig) NormalizeProductSchema() {
 		if c.CoinSource.HyperRankLimit <= 0 {
 			c.CoinSource.HyperRankLimit = 5
 		}
+	case "gina":
+		c.CoinSource.UseAI500 = false
+		c.CoinSource.UseOITop = false
+		c.CoinSource.UseOILow = false
+		c.CoinSource.UseHyperAll = false
+		c.CoinSource.UseHyperMain = false
+		if c.CoinSource.GinaVolumeTopN <= 0 {
+			c.CoinSource.GinaVolumeTopN = 20
+		}
+		if c.CoinSource.GinaPriceTopN <= 0 {
+			c.CoinSource.GinaPriceTopN = 5
+		}
 	default:
 		c.CoinSource.SourceType = "hyper_rank"
 		c.CoinSource.UseAI500 = false
@@ -265,6 +290,8 @@ func normalizeCoinSourceType(value string) string {
 		return "hyper_main"
 	case strings.Contains(value, "static") || strings.Contains(value, "固定") || strings.Contains(value, "静态"):
 		return "static"
+	case strings.Contains(compact, "gina"):
+		return "gina"
 	default:
 		return value
 	}
@@ -783,6 +810,18 @@ type CoinSourceConfig struct {
 	HyperRankDirection string `json:"hyper_rank_direction,omitempty"`
 	// Hyperliquid dynamic ranking maximum count. Defaults to 5 and is hard capped at 10 for AI context safety.
 	HyperRankLimit int `json:"hyper_rank_limit,omitempty"`
+
+	// ===== GINA source (Binance volume rank -> price-change rank) =====
+	// Number of top symbols by 24h quote volume to pre-filter (default 20).
+	GinaVolumeTopN int `json:"gina_volume_top_n,omitempty"`
+	// Number of top symbols per direction to keep (default 5: decline->long, increase->short).
+	// The combined long+short candidate list is still capped at MaxCandidateCoins.
+	GinaPriceTopN int `json:"gina_price_top_n,omitempty"`
+	// GinaSoftMode controls how strictly GINA rules bind the model.
+	// false (default) = hard gate: direction and entry conditions are enforced in code,
+	// the model may only be more conservative (wait), size, set SL/TP, or close earlier.
+	// true = soft signal: GINA data is advisory context only; the model decides freely.
+	GinaSoftMode bool `json:"gina_soft_mode,omitempty"`
 	// Note: API URLs are now built automatically using NofxOSAPIKey from IndicatorConfig
 }
 
@@ -1465,6 +1504,12 @@ func (c *StrategyConfig) getEffectiveCoinCount() int {
 		count = c.CoinSource.HyperMainLimit
 	case "hyper_all":
 		count = c.CoinSource.HyperMainLimit
+	case "gina":
+		// long + short directions, hard capped at MaxCandidateCoins downstream.
+		count = c.CoinSource.GinaPriceTopN * 2
+		if count > MaxCandidateCoins {
+			count = MaxCandidateCoins
+		}
 	default:
 		count = c.CoinSource.HyperRankLimit
 	}

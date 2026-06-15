@@ -166,6 +166,10 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 		return decision, fmt.Errorf("failed to parse AI response: %w", err)
 	}
 
+	// NOTE: price-aware post-validation (real risk/reward + GINA hard-gate/exit)
+	// runs in the trader loop via kernel.PostValidateDecisions, AFTER symbol
+	// canonicalization, so decision symbols match the candidate/market-data keys.
+
 	return decision, nil
 }
 
@@ -245,6 +249,26 @@ func fetchMarketDataWithStrategy(ctx *Context, engine *StrategyEngine) error {
 		}
 
 		ctx.MarketDataMap[coin.Symbol] = data
+	}
+
+	// Enrich with the settled funding-rate change signal (GINA). Cached ~1h
+	// since Binance settles every 8h, so this adds negligible API load. Skipped
+	// for xyz dex assets (no Binance funding history).
+	if config.Indicators.EnableFundingRate {
+		for sym, data := range ctx.MarketDataMap {
+			if data == nil || market.IsXyzDexAsset(sym) {
+				continue
+			}
+			fc, err := market.GetFundingRateChange(sym)
+			if err != nil || fc == nil {
+				continue
+			}
+			data.FundingRatePrev = fc.Prev
+			data.FundingRateChange = fc.Change
+			data.FundingTime = fc.FundingTime
+			data.NextFundingTime = fc.NextFundingTime
+			data.FundingStale = fc.Stale
+		}
 	}
 
 	logger.Infof("📊 Successfully fetched multi-timeframe market data for %d coins", len(ctx.MarketDataMap))

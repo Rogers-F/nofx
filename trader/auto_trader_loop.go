@@ -215,9 +215,12 @@ func (at *AutoTrader) runCycle() error {
 	// 8. Sort decisions: ensure close positions first, then open positions (prevent position stacking overflow)
 	logger.Info(strings.Repeat("-", 70))
 
-	// 8. Sort decisions: ensure close positions first, then open positions (prevent position stacking overflow)
-	sortedDecisions := sortDecisionsByPriority(aiDecision.Decisions)
-	sortedDecisions = at.filterDecisionsToStrategyUniverse(sortedDecisions, ctx)
+	// 8. Canonicalize symbols to the strategy universe FIRST, then apply the
+	// price-aware gate (real risk/reward + GINA hard-gate/exit) on canonical
+	// symbols, then sort close-first (so any injected GINA exits run before opens).
+	universeDecisions := at.filterDecisionsToStrategyUniverse(aiDecision.Decisions, ctx)
+	universeDecisions = kernel.PostValidateDecisions(ctx, at.strategyEngine, universeDecisions)
+	sortedDecisions := sortDecisionsByPriority(universeDecisions)
 
 	logger.Info("🔄 Execution order (optimized): Close positions first → Open positions later")
 	for i, d := range sortedDecisions {

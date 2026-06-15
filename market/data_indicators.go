@@ -146,6 +146,34 @@ func calculateBOLL(klines []Kline, period int, multiplier float64) (upper, middl
 	return upper, middle, lower
 }
 
+// calculateBOLLMiddleMomentum derives the normalized slope and acceleration of
+// the Bollinger middle band from its value series. The result is expressed as a
+// percentage of the middle band so it is comparable across symbols of different
+// price scales. Returned slices are aligned with the input (same length); the
+// first slope and the first two acceleration entries are zero because they have
+// no predecessor. Callers that need a closed-candle reading should use the
+// second-to-last entry when the latest candle may still be forming.
+func calculateBOLLMiddleMomentum(middle []float64) (slope, accel []float64) {
+	n := len(middle)
+	slope = make([]float64, n)
+	accel = make([]float64, n)
+	if n < 2 {
+		return slope, accel
+	}
+	for i := 1; i < n; i++ {
+		prev := middle[i-1]
+		if prev == 0 {
+			slope[i] = 0
+			continue
+		}
+		slope[i] = (middle[i] - prev) / prev * 100
+	}
+	for i := 2; i < n; i++ {
+		accel[i] = slope[i] - slope[i-1]
+	}
+	return slope, accel
+}
+
 // calculateDonchian calculates Donchian channel (highest high, lowest low) for given period
 func calculateDonchian(klines []Kline, period int) (upper, lower float64) {
 	if len(klines) == 0 || period <= 0 {
