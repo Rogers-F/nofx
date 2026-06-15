@@ -49,24 +49,12 @@ jobs:
             platform: linux/amd64
             arch_tag: amd64
             runner: ubuntu-22.04
-          - name: backend
-            dockerfile: ./docker/Dockerfile.backend
-            image_suffix: backend
-            platform: linux/arm64
-            arch_tag: arm64
-            runner: ubuntu-22.04-arm
           - name: frontend
             dockerfile: ./docker/Dockerfile.frontend
             image_suffix: frontend
             platform: linux/amd64
             arch_tag: amd64
             runner: ubuntu-22.04
-          - name: frontend
-            dockerfile: ./docker/Dockerfile.frontend
-            image_suffix: frontend
-            platform: linux/arm64
-            arch_tag: arm64
-            runner: ubuntu-22.04-arm
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -167,30 +155,26 @@ jobs:
           echo "Ref name: ${REF_NAME}"
 
           docker buildx imagetools create -t "${GHCR_IMAGE}:${REF_NAME}" \
-            "${GHCR_IMAGE}:${REF_NAME}-amd64" \
-            "${GHCR_IMAGE}:${REF_NAME}-arm64"
+            "${GHCR_IMAGE}:${REF_NAME}-amd64"
 
           # Only main branch gets the 'latest' tag (not dev)
           if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
             docker buildx imagetools create -t "${GHCR_IMAGE}:latest" \
-              "${GHCR_IMAGE}:${REF_NAME}-amd64" \
-              "${GHCR_IMAGE}:${REF_NAME}-arm64"
+              "${GHCR_IMAGE}:${REF_NAME}-amd64"
             echo "✅ Created latest tag (main branch only)"
           fi
 
           # release/stable branch gets the 'stable' tag
           if [[ "${{ github.ref }}" == "refs/heads/release/stable" ]]; then
             docker buildx imagetools create -t "${GHCR_IMAGE}:stable" \
-              "${GHCR_IMAGE}:${REF_NAME}-amd64" \
-              "${GHCR_IMAGE}:${REF_NAME}-arm64"
+              "${GHCR_IMAGE}:${REF_NAME}-amd64"
             echo "✅ Created stable tag (release/stable branch)"
           fi
 
           if [[ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]]; then
             DOCKERHUB_IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/nofx-${{ matrix.image_suffix }}"
             docker buildx imagetools create -t "${DOCKERHUB_IMAGE}:${REF_NAME}" \
-              "${DOCKERHUB_IMAGE}:${REF_NAME}-amd64" \
-              "${DOCKERHUB_IMAGE}:${REF_NAME}-arm64" || true
+              "${DOCKERHUB_IMAGE}:${REF_NAME}-amd64" || true
             echo "✅ Created Docker Hub manifest"
           fi
 
