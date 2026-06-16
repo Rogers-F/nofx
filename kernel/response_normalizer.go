@@ -106,7 +106,7 @@ func redactForLog(s string) string {
 //	defaultLeverage : leverage applied to an otherwise-valid open when the model
 //	                omits leverage. Pass 0 to keep the legacy fail-safe (missing
 //	                leverage → wait); a positive value is supplied ONLY for the
-//	                GINA source so non-GINA behavior is byte-for-byte unchanged.
+//	                GINA source, so for non-GINA callers the leverage-injection behavior is unchanged (a missing-leverage open still → wait). The open-verb synonyms in normalizeAction are global, however, so non-GINA open behavior is not unchanged in general.
 //
 // Returns the normalized standard-format string, whether it differs from the
 // raw input (changed), and a short reason code for logging.
@@ -340,21 +340,27 @@ func normalizeOne(rawObj map[string]interface{}, pool map[string]bool, price map
 }
 
 // normalizeAction maps a raw action verb (plus a resolved direction) onto the
-// standard action enum. Anything not unambiguously an open/close becomes
-// "wait" — including bare LONG/SHORT/BUY/SELL/HOLD/NO_TRADE/FLAT.
+// standard action enum. open_long/open_short and their enter_long/enter_short
+// synonyms map directly; open_position/open/enter/enter_trade resolve via the
+// direction (long→open_long, short→open_short, otherwise wait). Anything not
+// unambiguously an open/close becomes "wait" — including bare LONG/SHORT/BUY/
+// SELL/HOLD/NO_TRADE/FLAT: a bare direction word is treated as ambiguous, not an
+// open directive. enter_long/enter_short still pass the downstream side-
+// consistency gate (sideMatchesAction), so e.g. enter_long + side:short → wait.
+// enter_position is deliberately NOT a synonym (absent from the decision audit).
 func normalizeAction(rawAction, dir string) string {
 	a := strings.ToLower(strings.TrimSpace(rawAction))
 	a = strings.NewReplacer("-", "_", " ", "_").Replace(a)
 	switch a {
-	case "open_long":
+	case "open_long", "enter_long":
 		return "open_long"
-	case "open_short":
+	case "open_short", "enter_short":
 		return "open_short"
 	case "close_long":
 		return "close_long"
 	case "close_short":
 		return "close_short"
-	case "open_position", "open", "openposition":
+	case "open_position", "open", "openposition", "enter", "enter_trade":
 		if dir == "long" {
 			return "open_long"
 		}

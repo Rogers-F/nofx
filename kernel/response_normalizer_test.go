@@ -573,3 +573,95 @@ func TestNormalize_PositionSizeUsdtConflictWaits(t *testing.T) {
 	raw := `{"decision":"OPEN_LONG","symbol":"BTCUSDT","leverage":3,"stop_loss":90000,"take_profit":110000,"position_size_usd":200,"position_size_usdt":250}`
 	assertSingleAction(t, raw, "wait")
 }
+
+// ---------------------------------------------------------------------------
+// Open-action synonyms. Audit of all decision_records.raw_response showed the
+// model (gpt-5.5) frequently emits enter_long/enter_short/enter/enter_trade as
+// the verb; the normalizer must recognize them as open intent while still
+// crossing every existing open safety gate. Bare direction words and close/exit
+// flavored verbs are deliberately NOT mapped.
+// ---------------------------------------------------------------------------
+
+// enter_long/enter_short map directly to the standard open actions; enter and
+// enter_trade resolve via an explicit side; a missing or conflicting side fails
+// safe to wait.
+func TestNormalize_EnterSynonyms(t *testing.T) {
+	assertSingleAction(t, `{"action":"enter_long","symbol":"BTCUSDT","notional_usd":200,"leverage":3,"stop_loss":90000,"take_profit":110000,"confidence":80}`, "open_long")
+	assertSingleAction(t, `{"action":"enter_short","symbol":"BTCUSDT","notional_usd":200,"leverage":3,"stop_loss":110000,"take_profit":90000,"confidence":80}`, "open_short")
+	assertSingleAction(t, `{"action":"enter","side":"long","symbol":"BTCUSDT","notional_usd":200,"leverage":3,"stop_loss":90000,"take_profit":110000}`, "open_long")
+	assertSingleAction(t, `{"action":"enter_trade","side":"short","symbol":"BTCUSDT","notional_usd":200,"leverage":3,"stop_loss":110000,"take_profit":90000}`, "open_short")
+	// enter / enter_trade with NO resolvable direction must wait.
+	assertSingleAction(t, `{"action":"enter","symbol":"BTCUSDT","notional_usd":200,"leverage":3,"stop_loss":90000,"take_profit":110000}`, "wait")
+	assertSingleAction(t, `{"action":"enter_trade","symbol":"BTCUSDT","notional_usd":200,"leverage":3,"stop_loss":90000,"take_profit":110000}`, "wait")
+	// enter_long contradicted by side:short is ambiguous → wait (side gate holds).
+	assertSingleAction(t, `{"action":"enter_long","side":"short","symbol":"BTCUSDT","notional_usd":200,"leverage":3,"stop_loss":90000,"take_profit":110000}`, "wait")
+}
+
+// Bare direction words (and bare buy/sell) are NOT open directives even with a
+// consistent side — they remain ambiguous → wait, guarding against opening on a
+// mere opinion word.
+func TestNormalize_BareDirectionWordsStayWait(t *testing.T) {
+	for _, raw := range []string{
+		`{"action":"long","symbol":"BTCUSDT","notional_usd":200,"leverage":3,"stop_loss":90000,"take_profit":110000}`,
+		`{"action":"long","side":"long","symbol":"BTCUSDT","notional_usd":200,"leverage":3,"stop_loss":90000,"take_profit":110000}`,
+		`{"action":"short","side":"short","symbol":"BTCUSDT","notional_usd":200,"leverage":3,"stop_loss":110000,"take_profit":90000}`,
+		`{"action":"buy","side":"long","symbol":"BTCUSDT","notional_usd":200,"leverage":3,"stop_loss":90000,"take_profit":110000}`,
+		`{"action":"sell","side":"short","symbol":"BTCUSDT","notional_usd":200,"leverage":3,"stop_loss":110000,"take_profit":90000}`,
+	} {
+		assertSingleAction(t, raw, "wait")
+	}
+}
+
+// Only close_long/close_short pass through; exit/take_profit flavored verbs must
+// never be invented into a close → they collapse to wait.
+func TestNormalize_NoCloseExitSynonyms(t *testing.T) {
+	for _, raw := range []string{
+		`{"action":"exit_long","symbol":"BTCUSDT"}`,
+		`{"action":"take_profit","symbol":"BTCUSDT"}`,
+		`{"action":"exit","side":"long","symbol":"BTCUSDT"}`,
+	} {
+		assertSingleAction(t, raw, "wait")
+	}
+}
+
+// enter_position was deliberately excluded (audit showed 0 occurrences); it must
+// still collapse to wait even with a clear side, locking the exclusion.
+func TestNormalize_EnterPositionExcludedStaysWait(t *testing.T) {
+	assertSingleAction(t, `{"action":"enter_position","side":"long","symbol":"BTCUSDT","notional_usd":200,"leverage":3,"stop_loss":90000,"take_profit":110000}`, "wait")
+}
+
+// An enter_long verb conflicting with a same-family alias (decision/signal) is an
+// alias-family conflict → wait, never a silent priority pick.
+func TestNormalize_EnterSynonymAliasConflictWaits(t *testing.T) {
+	assertSingleAction(t, `{"action":"enter_long","decision":"no_trade","side":"long","symbol":"BTCUSDT","notional_usd":200,"leverage":3,"stop_loss":90000,"take_profit":110000}`, "wait")
+}
+
+// ENTER_LONG on the GINA path (missing leverage + positive defaultLeverage)
+// injects the default leverage and opens — the real gpt-5.5 case.
+func TestNormalize_EnterLongGinaLeverageInjection(t *testing.T) {
+	raw := `{"decision":"ENTER_LONG","symbol":"XLMUSDT","suggested_notional_usdt":40,"stop_loss":0.45,"take_profit":0.65}`
+	pool := []string{"XLMUSDT"}
+	price := map[string]float64{"XLMUSDT": 0.5}
+	n, _, _ := NormalizeAIResponse(raw, pool, price, 95, 3)
+	ds := parseNormalized(t, n)
+	if len(ds) != 1 || ds[0].Action != "open_long" {
+		t.Fatalf("ENTER_LONG GINA open must inject leverage and open_long, got %+v", ds)
+	}
+	if ds[0].Leverage != 3 {
+		t.Fatalf("expected injected leverage 3, got %v", ds[0].Leverage)
+	}
+}
+
+// BLAST-RADIUS LOCK (do not delete — this is intended, not a bug): the normalizer
+// is global, so a NON-GINA caller (defaultLeverage=0) emitting enter_long still
+// fails safe to wait when leverage is missing, but WILL open_long when every open
+// field is present. This is the documented behavior change from the pre-synonym
+// wait. If it must change, gate the enter_* synonyms by source explicitly.
+func TestNormalize_EnterLongNonGinaBlastRadius(t *testing.T) {
+	// Non-GINA (assertSingleAction uses defaultLeverage=0): missing leverage still
+	// fails safe to wait — the pre-synonym safety is unchanged.
+	assertSingleAction(t, `{"action":"enter_long","symbol":"BTCUSDT","notional_usd":200,"stop_loss":90000,"take_profit":110000}`, "wait")
+	// Every open field present → open_long. This is the documented, intended
+	// behavior change from the pre-synonym wait, NOT a bug.
+	assertSingleAction(t, `{"action":"enter_long","symbol":"BTCUSDT","notional_usd":200,"leverage":3,"stop_loss":90000,"take_profit":110000}`, "open_long")
+}
