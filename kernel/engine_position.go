@@ -10,16 +10,22 @@ import (
 // Decision Validation
 // ============================================================================
 
-func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64) error {
+func validateDecisions(decisions []Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64, clampOversize bool) error {
 	for i := range decisions {
-		if err := validateDecision(&decisions[i], accountEquity, btcEthLeverage, altcoinLeverage, btcEthPosRatio, altcoinPosRatio); err != nil {
+		if err := validateDecision(&decisions[i], accountEquity, btcEthLeverage, altcoinLeverage, btcEthPosRatio, altcoinPosRatio, clampOversize); err != nil {
 			return fmt.Errorf("decision #%d validation failed: %w", i+1, err)
 		}
 	}
 	return nil
 }
 
-func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64) error {
+// validateDecision validates a single decision against leverage, size, and
+// price-direction rules. When clampOversize is true (GINA source) an open whose
+// notional exceeds the per-tier cap is clamped DOWN to the cap instead of being
+// rejected, so one oversize size cannot fail the whole batch; the execution layer
+// re-applies the cap with fresh equity. For every other source clampOversize is
+// false and the legacy hard-reject is preserved unchanged.
+func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64, clampOversize bool) error {
 	validActions := map[string]bool{
 		"open_long":   true,
 		"open_short":  true,
@@ -41,15 +47,14 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 		//     and the user's quick-trade flow shows them at the higher cap,
 		//     so the validator must match.
 		//   - Everything else is altcoin (1x equity by default).
+		isMajor := d.Symbol == "BTCUSDT" || d.Symbol == "ETHUSDT" || market.IsXyzDexAsset(d.Symbol)
 		maxLeverage := altcoinLeverage
 		posRatio := altcoinPosRatio
-		maxPositionValue := accountEquity * posRatio
-		isMajor := d.Symbol == "BTCUSDT" || d.Symbol == "ETHUSDT" || market.IsXyzDexAsset(d.Symbol)
 		if isMajor {
 			maxLeverage = btcEthLeverage
 			posRatio = btcEthPosRatio
-			maxPositionValue = accountEquity * posRatio
 		}
+		maxPositionValue := accountEquity * posRatio
 
 		if d.Leverage <= 0 {
 			return fmt.Errorf("leverage must be greater than 0: %d", d.Leverage)
@@ -78,13 +83,23 @@ func validateDecision(d *Decision, accountEquity float64, btcEthLeverage, altcoi
 
 		tolerance := maxPositionValue * 0.01
 		if d.PositionSizeUSD > maxPositionValue+tolerance {
-			switch {
-			case d.Symbol == "BTCUSDT" || d.Symbol == "ETHUSDT":
-				return fmt.Errorf("BTC/ETH single coin position value cannot exceed %.0f USDT (%.1fx account equity), actual: %.0f", maxPositionValue, posRatio, d.PositionSizeUSD)
-			case market.IsXyzDexAsset(d.Symbol):
-				return fmt.Errorf("%s position value cannot exceed %.0f USDT (%.1fx account equity), actual: %.0f", d.Symbol, maxPositionValue, posRatio, d.PositionSizeUSD)
-			default:
-				return fmt.Errorf("altcoin single coin position value cannot exceed %.0f USDT (%.1fx account equity), actual: %.0f", maxPositionValue, posRatio, d.PositionSizeUSD)
+			if clampOversize {
+				// GINA: clamp an oversize open down to the per-tier cap instead of
+				// failing the whole batch, so a single oversize size cannot block all
+				// decisions in the cycle. The execution layer re-applies the cap with
+				// fresh equity, so this clamped value is the audited intent.
+				logger.Infof("✂️  [Oversize Clamp] %s position %.0f exceeds cap %.0f USDT (%.1fx equity), clamping to cap",
+					d.Symbol, d.PositionSizeUSD, maxPositionValue, posRatio)
+				d.PositionSizeUSD = maxPositionValue
+			} else {
+				switch {
+				case d.Symbol == "BTCUSDT" || d.Symbol == "ETHUSDT":
+					return fmt.Errorf("BTC/ETH single coin position value cannot exceed %.0f USDT (%.1fx account equity), actual: %.0f", maxPositionValue, posRatio, d.PositionSizeUSD)
+				case market.IsXyzDexAsset(d.Symbol):
+					return fmt.Errorf("%s position value cannot exceed %.0f USDT (%.1fx account equity), actual: %.0f", d.Symbol, maxPositionValue, posRatio, d.PositionSizeUSD)
+				default:
+					return fmt.Errorf("altcoin single coin position value cannot exceed %.0f USDT (%.1fx account equity), actual: %.0f", maxPositionValue, posRatio, d.PositionSizeUSD)
+				}
 			}
 		}
 		if d.StopLoss <= 0 || d.TakeProfit <= 0 {

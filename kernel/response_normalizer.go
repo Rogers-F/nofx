@@ -46,6 +46,13 @@ const (
 	normalizerShadow = "shadow"
 )
 
+// ginaDefaultLeverage is the leverage injected for the GINA source when the model
+// omits leverage on an otherwise-valid open. Notional is independently capped at
+// ≤ tier ratio × equity and SL/TP are mandatory, so leverage mainly affects the
+// liquidation buffer; a small value keeps that buffer wide. The injected value is
+// still per-tier clamped by validateDecision.
+const ginaDefaultLeverage = 3
+
 // reSecretKV redacts obvious credential-looking key/value pairs before logging.
 // The optional quotes tolerate JSON-style `"api_key":"..."` as well as
 // header/env style `api_key=...` / `authorization: ...`.
@@ -96,10 +103,14 @@ func redactForLog(s string) string {
 //	equity        : account equity in USDT, used only to convert a
 //	                percent-of-equity position size into a USD notional. Pass 0
 //	                when unknown — percent-based sizing then fails safe to wait.
+//	defaultLeverage : leverage applied to an otherwise-valid open when the model
+//	                omits leverage. Pass 0 to keep the legacy fail-safe (missing
+//	                leverage → wait); a positive value is supplied ONLY for the
+//	                GINA source so non-GINA behavior is byte-for-byte unchanged.
 //
 // Returns the normalized standard-format string, whether it differs from the
 // raw input (changed), and a short reason code for logging.
-func NormalizeAIResponse(raw string, candidatePool []string, currentPrice map[string]float64, equity float64) (normalized string, changed bool, reason string) {
+func NormalizeAIResponse(raw string, candidatePool []string, currentPrice map[string]float64, equity float64, defaultLeverage int) (normalized string, changed bool, reason string) {
 	pool := make(map[string]bool, len(candidatePool))
 	for _, s := range candidatePool {
 		if t := strings.TrimSpace(s); t != "" {
@@ -137,7 +148,7 @@ func NormalizeAIResponse(raw string, candidatePool []string, currentPrice map[st
 	out := make([]Decision, 0, len(rawDecisions))
 	waitCount := 0
 	for _, rd := range rawDecisions {
-		d := normalizeOne(rd, pool, currentPrice, equity)
+		d := normalizeOne(rd, pool, currentPrice, equity, defaultLeverage)
 		if d.Action == "wait" {
 			waitCount++
 		}
@@ -178,7 +189,7 @@ func extractRawDecisionObjects(frag string) ([]map[string]interface{}, string) {
 
 // normalizeOne maps one free-form decision object to a standard Decision,
 // downgrading to "wait" whenever any open-position safety gate is not met.
-func normalizeOne(rawObj map[string]interface{}, pool map[string]bool, price map[string]float64, equity float64) Decision {
+func normalizeOne(rawObj map[string]interface{}, pool map[string]bool, price map[string]float64, equity float64, defaultLeverage int) Decision {
 	// Flatten known wrapper objects (e.g. position_sizing{}, risk_management{})
 	// up to the top level so nested decisions are reachable; this also lower-cases
 	// keys and reports case/placement conflicts exactly like lowerKeys.
@@ -245,7 +256,7 @@ func normalizeOne(rawObj map[string]interface{}, pool map[string]bool, price map
 	// treated as USD notional. If no USD notional is given, fall back to a
 	// percent-of-equity size (e.g. variant-style "position_size_pct_equity"),
 	// converted with the account equity.
-	posUSD, hasUSD := firstFloat(m, "position_size_usd", "notional_usd", "notional_usdt", "suggested_notional_usdt", "notional")
+	posUSD, hasUSD := firstFloat(m, "position_size_usd", "position_size_usdt", "notional_usd", "notional_usdt", "suggested_notional_usdt", "notional")
 	if !hasUSD {
 		if pct, ok := firstFloat(m, "position_size_pct_equity", "position_size_pct", "pct_equity"); ok && equity > 0 {
 			if usd := pctEquityToUSD(pct, equity); usd > 0 {
@@ -261,6 +272,15 @@ func normalizeOne(rawObj map[string]interface{}, pool map[string]bool, price map
 	leverage := 0
 	if l, ok := firstFloat(m, "leverage"); ok {
 		leverage = int(l + 0.5)
+	}
+	// GINA path: the configured prompt frequently omits leverage, which would
+	// otherwise fail gate ③ below. When a positive defaultLeverage is supplied
+	// (GINA-only at the call site) inject it for an otherwise-valid open. This
+	// defaults ONLY leverage — direction, size, SL and TP are never invented — and
+	// the value is still per-tier clamped downstream by validateDecision.
+	// defaultLeverage==0 preserves the legacy missing-leverage → wait behavior.
+	if leverage <= 0 && defaultLeverage > 0 {
+		leverage = defaultLeverage
 	}
 
 	// ② symbol must exactly match the candidate pool (no fuzzy completion).
@@ -677,7 +697,7 @@ var criticalConflictKeys = []string{
 	"action", "decision", "signal",
 	"symbol", "ticker",
 	"side", "direction", "position_side",
-	"position_size_usd", "notional_usd", "notional_usdt", "suggested_notional_usdt", "notional",
+	"position_size_usd", "position_size_usdt", "notional_usd", "notional_usdt", "suggested_notional_usdt", "notional",
 	"position_size_pct_equity", "position_size_pct", "pct_equity",
 	"stop_loss", "sl", "stop_price", "stoploss",
 	"take_profit", "take_profit_1", "tp", "tp1", "target_price", "takeprofit",
@@ -699,7 +719,7 @@ var aliasFamilies = [][]string{
 	{"action", "decision", "signal"},
 	{"symbol", "ticker"},
 	{"side", "direction", "position_side"},
-	{"position_size_usd", "notional_usd", "notional_usdt", "suggested_notional_usdt", "notional"},
+	{"position_size_usd", "position_size_usdt", "notional_usd", "notional_usdt", "suggested_notional_usdt", "notional"},
 	{"position_size_pct_equity", "position_size_pct", "pct_equity"},
 	{"stop_loss", "sl", "stop_price", "stoploss"},
 	{"take_profit", "take_profit_1", "tp", "tp1", "target_price", "takeprofit"},

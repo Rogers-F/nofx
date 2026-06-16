@@ -25,7 +25,7 @@ func TestNormalize_Sample1_NonUSDSizeMustWait(t *testing.T) {
 	pool := []string{"xyz:SNDK"}
 	price := map[string]float64{"xyz:SNDK": 2000.0} // between SL and TP — only the USD gate should fail
 
-	normalized, changed, _ := NormalizeAIResponse(raw, pool, price, 1000)
+	normalized, changed, _ := NormalizeAIResponse(raw, pool, price, 1000, 0)
 	if !changed {
 		t.Fatalf("expected changed=true for free-form input")
 	}
@@ -45,7 +45,7 @@ func TestNormalize_Sample2_WatchlistNotOrders(t *testing.T) {
 	pool := []string{"xyz:SP500"}
 	price := map[string]float64{"xyz:SP500": 5000.0}
 
-	normalized, _, _ := NormalizeAIResponse(raw, pool, price, 1000)
+	normalized, _, _ := NormalizeAIResponse(raw, pool, price, 1000, 0)
 	ds := parseNormalized(t, normalized)
 	if len(ds) != 1 {
 		t.Fatalf("expected 1 decision, got %d: %+v", len(ds), ds)
@@ -81,7 +81,7 @@ func TestNormalize_Sample3_ActionVariants(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			normalized, _, _ := NormalizeAIResponse(tc.raw, pool, price, 1000)
+			normalized, _, _ := NormalizeAIResponse(tc.raw, pool, price, 1000, 0)
 			ds := parseNormalized(t, normalized)
 			if len(ds) != 1 {
 				t.Fatalf("expected 1 decision, got %d: %+v", len(ds), ds)
@@ -114,7 +114,7 @@ func TestNormalize_PriceDirectionMismatch(t *testing.T) {
 	pool := []string{"BTCUSDT"}
 	price := map[string]float64{"BTCUSDT": 100000.0}
 
-	normalized, _, _ := NormalizeAIResponse(raw, pool, price, 1000)
+	normalized, _, _ := NormalizeAIResponse(raw, pool, price, 1000, 0)
 	ds := parseNormalized(t, normalized)
 	if len(ds) != 1 || ds[0].Action != "wait" {
 		t.Fatalf("inverted SL/TP must be wait, got %+v", ds)
@@ -127,7 +127,7 @@ func TestNormalize_SymbolNotInPool(t *testing.T) {
 	pool := []string{"BTCUSDT"}
 	price := map[string]float64{"DOGEUSDT": 0.2}
 
-	normalized, _, _ := NormalizeAIResponse(raw, pool, price, 1000)
+	normalized, _, _ := NormalizeAIResponse(raw, pool, price, 1000, 0)
 	ds := parseNormalized(t, normalized)
 	if len(ds) != 1 || ds[0].Action != "wait" {
 		t.Fatalf("out-of-pool symbol must be wait, got %+v", ds)
@@ -160,7 +160,7 @@ func TestNormalize_ExtractionPaths(t *testing.T) {
 // No JSON anywhere → overall fail-safe wait.
 func TestNormalize_NoJSON_FailSafeWait(t *testing.T) {
 	raw := "I considered the market but decided to provide only prose, no JSON."
-	normalized, _, reason := NormalizeAIResponse(raw, []string{"BTCUSDT"}, map[string]float64{"BTCUSDT": 100000}, 1000)
+	normalized, _, reason := NormalizeAIResponse(raw, []string{"BTCUSDT"}, map[string]float64{"BTCUSDT": 100000}, 1000, 0)
 	if reason != "no_json_found" {
 		t.Fatalf("reason = %q, want no_json_found", reason)
 	}
@@ -172,7 +172,7 @@ func TestNormalize_NoJSON_FailSafeWait(t *testing.T) {
 
 func mustNormalize(t *testing.T, raw string, pool []string, price map[string]float64) string {
 	t.Helper()
-	n, _, _ := NormalizeAIResponse(raw, pool, price, 1000)
+	n, _, _ := NormalizeAIResponse(raw, pool, price, 1000, 0)
 	return n
 }
 
@@ -350,7 +350,7 @@ func TestNormalize_VariantNestedEnvelopeOpens(t *testing.T) {
 // Percent-of-equity sizing with NO equity available cannot be converted → wait.
 func TestNormalize_VariantPctSizeNoEquityMustWait(t *testing.T) {
 	raw := `{"decision":"OPEN_LONG","symbol":"BTCUSDT","leverage":2,"stop_loss":90000,"take_profit_1":110000,"position_size_pct_equity":20}`
-	n, _, _ := NormalizeAIResponse(raw, hardenPool, hardenPrice, 0)
+	n, _, _ := NormalizeAIResponse(raw, hardenPool, hardenPrice, 0, 0)
 	ds := parseNormalized(t, n)
 	if len(ds) != 1 || ds[0].Action != "wait" {
 		t.Fatalf("pct size without equity must wait, got %+v", ds)
@@ -506,4 +506,57 @@ func TestRedactForLog(t *testing.T) {
 			t.Fatalf("redactForLog failed to mask secret in %q → %q", in, got)
 		}
 	}
+}
+
+// The GINA schema commonly omits leverage; with a positive defaultLeverage the
+// otherwise-valid open is injected with that leverage and opens, instead of the
+// missing-leverage fail-safe wait. This is the Change-A core fix.
+func TestNormalize_MissingLeverageInjectsDefaultForGina(t *testing.T) {
+	raw := `{"decision":"OPEN_POSITION","side":"LONG","symbol":"XLMUSDT","suggested_notional_usdt":40,"entry_price":0.5,"stop_loss":0.45,"take_profit":0.65}`
+	pool := []string{"XLMUSDT"}
+	price := map[string]float64{"XLMUSDT": 0.5} // between SL and TP
+	n, _, _ := NormalizeAIResponse(raw, pool, price, 95, 3)
+	ds := parseNormalized(t, n)
+	if len(ds) != 1 || ds[0].Action != "open_long" {
+		t.Fatalf("missing-leverage GINA open must inject and open_long, got %+v", ds)
+	}
+	if ds[0].Leverage != 3 {
+		t.Fatalf("expected injected leverage 3, got %v", ds[0].Leverage)
+	}
+	if ds[0].PositionSizeUSD != 40 {
+		t.Fatalf("expected notional 40 from suggested_notional_usdt, got %v", ds[0].PositionSizeUSD)
+	}
+}
+
+// With defaultLeverage 0 (non-GINA) a missing leverage still fails safe to wait —
+// non-GINA behavior is byte-for-byte unchanged.
+func TestNormalize_MissingLeverageNoDefaultWaits(t *testing.T) {
+	raw := `{"decision":"OPEN_POSITION","side":"LONG","symbol":"XLMUSDT","suggested_notional_usdt":40,"entry_price":0.5,"stop_loss":0.45,"take_profit":0.65}`
+	pool := []string{"XLMUSDT"}
+	price := map[string]float64{"XLMUSDT": 0.5}
+	n, _, _ := NormalizeAIResponse(raw, pool, price, 95, 0)
+	ds := parseNormalized(t, n)
+	if len(ds) != 1 || ds[0].Action != "wait" {
+		t.Fatalf("missing-leverage with no default must wait, got %+v", ds)
+	}
+}
+
+// position_size_usdt is recognized as a USD notional alias (new), so an otherwise
+// valid open sizes from it.
+func TestNormalize_PositionSizeUsdtAlias(t *testing.T) {
+	raw := `{"decision":"OPEN_LONG","symbol":"BTCUSDT","leverage":3,"stop_loss":90000,"take_profit":110000,"position_size_usdt":250}`
+	ds := parseNormalized(t, mustNormalize(t, raw, hardenPool, hardenPrice))
+	if len(ds) != 1 || ds[0].Action != "open_long" {
+		t.Fatalf("position_size_usdt open expected, got %+v", ds)
+	}
+	if ds[0].PositionSizeUSD != 250 {
+		t.Fatalf("expected 250 from position_size_usdt, got %v", ds[0].PositionSizeUSD)
+	}
+}
+
+// position_size_usdt disagreeing with position_size_usd is an alias-family conflict
+// → wait, never a silent pick.
+func TestNormalize_PositionSizeUsdtConflictWaits(t *testing.T) {
+	raw := `{"decision":"OPEN_LONG","symbol":"BTCUSDT","leverage":3,"stop_loss":90000,"take_profit":110000,"position_size_usd":200,"position_size_usdt":250}`
+	assertSingleAction(t, raw, "wait")
 }

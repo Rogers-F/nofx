@@ -53,6 +53,23 @@ func (at *AutoTrader) executeDecisionWithRecord(decision *kernel.Decision, actio
 	}
 }
 
+// existingPositionSide returns the side ("long"/"short") of an open position on
+// the symbol, or "" if none. Used to refuse both a duplicate same-side open and a
+// REVERSE open: every exchange's OpenLong/OpenShort first calls CancelAllOrders for
+// the symbol, which would strip an existing opposite position's stop-loss/take-
+// profit and leave it naked. The model must close before reversing.
+func existingPositionSide(positions []map[string]interface{}, symbol string) string {
+	for _, pos := range positions {
+		if pos["symbol"] != symbol {
+			continue
+		}
+		if s, ok := pos["side"].(string); ok && (s == "long" || s == "short") {
+			return s
+		}
+	}
+	return ""
+}
+
 // executeOpenLongWithRecord executes open long position and records detailed information
 func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actionRecord *store.DecisionAction) error {
 	logger.Infof("  📈 Open long: %s", decision.Symbol)
@@ -75,11 +92,14 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *kernel.Decision, actio
 		return err
 	}
 
-	// Check if there's already a position in the same symbol and direction
-	for _, pos := range positions {
-		if pos["symbol"] == decision.Symbol && pos["side"] == "long" {
-			return fmt.Errorf("❌ %s already has long position, close it first", decision.Symbol)
-		}
+	// Refuse a duplicate long AND a reverse open: opening any new position calls
+	// CancelAllOrders(symbol) first, which would strip an existing short's stop-loss
+	// and leave it naked. Close before reversing.
+	switch existingPositionSide(positions, decision.Symbol) {
+	case "long":
+		return fmt.Errorf("❌ %s already has long position, close it first", decision.Symbol)
+	case "short":
+		return fmt.Errorf("❌ %s has an opposite short position; close it before opening long (a reverse open would cancel its stop-loss protection)", decision.Symbol)
 	}
 
 	// Get current price
@@ -195,11 +215,14 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *kernel.Decision, acti
 		return err
 	}
 
-	// Check if there's already a position in the same symbol and direction
-	for _, pos := range positions {
-		if pos["symbol"] == decision.Symbol && pos["side"] == "short" {
-			return fmt.Errorf("❌ %s already has short position, close it first", decision.Symbol)
-		}
+	// Refuse a duplicate short AND a reverse open: opening any new position calls
+	// CancelAllOrders(symbol) first, which would strip an existing long's stop-loss
+	// and leave it naked. Close before reversing.
+	switch existingPositionSide(positions, decision.Symbol) {
+	case "short":
+		return fmt.Errorf("❌ %s already has short position, close it first", decision.Symbol)
+	case "long":
+		return fmt.Errorf("❌ %s has an opposite long position; close it before opening short (a reverse open would cancel its stop-loss protection)", decision.Symbol)
 	}
 
 	// Get current price

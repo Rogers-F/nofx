@@ -121,6 +121,11 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 	//     off (default): parseInput stays the raw response — behavior unchanged.
 	//     on: feed the normalized standard-format response to the parser.
 	//     shadow: compute + log the normalized response but still parse the raw.
+	// GINA-scoped policy: only the GINA source defaults a missing leverage (Change
+	// A) and clamps an oversize notional instead of rejecting the batch (Change B).
+	// Every other source passes 0 / false so its behavior is byte-for-byte unchanged.
+	isGina := engine.GetConfig().CoinSource.SourceType == "gina"
+
 	parseInput := aiResponse
 	if mode := normalizerMode(); mode == normalizerOn || mode == normalizerShadow {
 		pool := make([]string, 0, len(ctx.CandidateCoins))
@@ -133,7 +138,11 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 				priceMap[sym] = d.CurrentPrice
 			}
 		}
-		normalized, changed, reason := NormalizeAIResponse(aiResponse, pool, priceMap, ctx.Account.TotalEquity)
+		normalizerDefaultLeverage := 0
+		if isGina {
+			normalizerDefaultLeverage = ginaDefaultLeverage
+		}
+		normalized, changed, reason := NormalizeAIResponse(aiResponse, pool, priceMap, ctx.Account.TotalEquity, normalizerDefaultLeverage)
 		if mode == normalizerOn {
 			parseInput = normalized
 			logger.Infof("🔁 [Normalizer:on] changed=%v reason=%s raw=%s",
@@ -152,6 +161,7 @@ func GetFullDecisionWithStrategy(ctx *Context, mcpClient mcp.AIClient, engine *S
 		riskConfig.AltcoinMaxLeverage,
 		riskConfig.BTCETHMaxPositionValueRatio,
 		riskConfig.AltcoinMaxPositionValueRatio,
+		isGina,
 	)
 
 	if decision != nil {
@@ -315,7 +325,7 @@ func pruneCandidateCoinsWithoutMarketData(ctx *Context) {
 // AI Response Parsing
 // ============================================================================
 
-func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64) (*FullDecision, error) {
+func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthLeverage, altcoinLeverage int, btcEthPosRatio, altcoinPosRatio float64, clampOversize bool) (*FullDecision, error) {
 	cotTrace := extractCoTTrace(aiResponse)
 
 	decisions, err := extractDecisions(aiResponse)
@@ -326,7 +336,7 @@ func parseFullDecisionResponse(aiResponse string, accountEquity float64, btcEthL
 		}, fmt.Errorf("failed to extract decisions: %w", err)
 	}
 
-	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage, btcEthPosRatio, altcoinPosRatio); err != nil {
+	if err := validateDecisions(decisions, accountEquity, btcEthLeverage, altcoinLeverage, btcEthPosRatio, altcoinPosRatio, clampOversize); err != nil {
 		return &FullDecision{
 			CoTTrace:  cotTrace,
 			Decisions: decisions,
