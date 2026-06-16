@@ -457,10 +457,23 @@ func TestNormalize_MissingCurrentPriceMustWait(t *testing.T) {
 	}
 }
 
-// close_* are downgraded to wait in this first version.
-func TestNormalize_CloseDowngradedToWait(t *testing.T) {
-	assertSingleAction(t, `{"action":"close_long","symbol":"BTCUSDT"}`, "wait")
-	assertSingleAction(t, `{"action":"close_short","symbol":"BTCUSDT"}`, "wait")
+// close_long/close_short pass through (no order params, not pool-gated) so the
+// model can actually exit a held position; a symbol-less close fails safe to wait.
+func TestNormalize_ClosePassesThrough(t *testing.T) {
+	assertSingleAction(t, `{"action":"close_long","symbol":"BTCUSDT"}`, "close_long")
+	assertSingleAction(t, `{"action":"close_short","symbol":"BTCUSDT"}`, "close_short")
+	// Not gated by the candidate pool — a held position may be on a symbol GINA
+	// did not select this cycle.
+	assertSingleAction(t, `{"action":"close_long","symbol":"DOGEUSDT"}`, "close_long")
+	// A symbol-less close is ambiguous → wait.
+	assertSingleAction(t, `{"action":"close_long"}`, "wait")
+	// A present side must agree with the close direction (same rule as opens): a
+	// contradicting or unresolved side could close the wrong leg → wait.
+	assertSingleAction(t, `{"action":"close_long","symbol":"BTCUSDT","side":"short"}`, "wait")
+	assertSingleAction(t, `{"action":"close_short","symbol":"BTCUSDT","side":"long"}`, "wait")
+	assertSingleAction(t, `{"action":"close_long","symbol":"BTCUSDT","side":"flat"}`, "wait")
+	// A matching side passes.
+	assertSingleAction(t, `{"action":"close_long","symbol":"BTCUSDT","side":"long"}`, "close_long")
 }
 
 // A fully valid short opens; an inverted SL/TP short is rejected.

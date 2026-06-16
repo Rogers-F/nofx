@@ -228,8 +228,28 @@ func normalizeOne(rawObj map[string]interface{}, pool map[string]bool, price map
 		confidence = int(c + 0.5)
 	}
 
-	// Non-open actions (wait/hold and — in v1 — close_*) never carry order
-	// parameters; collapse them all to a plain "wait".
+	// Closes carry no order parameters (no leverage/size/SL/TP) and are never
+	// gated by the candidate pool or price checks — the executor closes the
+	// matching position (if none is held the exchange rejects just that one
+	// decision; it is logged and skipped, never fatal). Emit them directly so the
+	// model can actually exit a position; a symbol-less close is ambiguous and
+	// fails safe to wait.
+	if action == "close_long" || action == "close_short" {
+		if symbol == "" {
+			return waitDecision(symbol, reasoning, "close_missing_symbol")
+		}
+		// A present side-like field must agree with the close direction (same rule
+		// as opens): close_long needs side long/absent, close_short needs short/
+		// absent. A present-but-unresolved or contradicting side is ambiguous on a
+		// money path — it could close the wrong leg — so fail safe to wait.
+		if !sideMatchesAction(action, dir, sidePresent) {
+			return waitDecision(symbol, reasoning, "ambiguous_or_conflicting_side")
+		}
+		return Decision{Symbol: symbol, Action: action, Reasoning: reasoning}
+	}
+
+	// Remaining non-open actions (wait/hold/unknown) carry no order parameters;
+	// collapse them all to a plain "wait".
 	if action != "open_long" && action != "open_short" {
 		return waitDecision(symbol, reasoning, "non_open_action")
 	}
@@ -241,14 +261,8 @@ func normalizeOne(rawObj map[string]interface{}, pool map[string]bool, price map
 	// agree with the action's direction; a present-but-unresolved side ("flat",
 	// "not long", "long/short", ...) or a contradicting side is ambiguous → wait.
 	// An absent side is fine — the explicit open_* action is itself the directive.
-	if sidePresent {
-		want := "long"
-		if action == "open_short" {
-			want = "short"
-		}
-		if dir != want {
-			return waitDecision(symbol, reasoning, "ambiguous_or_conflicting_side")
-		}
+	if !sideMatchesAction(action, dir, sidePresent) {
+		return waitDecision(symbol, reasoning, "ambiguous_or_conflicting_side")
 	}
 
 	// USD size only from notional-denominated fields. Bare position_size/size/
@@ -351,6 +365,23 @@ func normalizeAction(rawAction, dir string) string {
 	default:
 		return "wait"
 	}
+}
+
+// sideMatchesAction reports whether a present side-like field is consistent with
+// the action's direction. An absent side is always fine — the explicit *_long /
+// *_short action is itself the directive. A present side must resolve to the
+// action's direction; present-but-unresolved ("flat", "long/short", ...) or a
+// contradicting side returns false so the caller fails safe to wait. Shared by the
+// open and close paths so neither acts on an ambiguous direction.
+func sideMatchesAction(action, dir string, sidePresent bool) bool {
+	if !sidePresent {
+		return true
+	}
+	want := "long"
+	if action == "open_short" || action == "close_short" {
+		want = "short"
+	}
+	return dir == want
 }
 
 // resolveSide extracts an EXPLICIT long/short direction from side-like fields.
