@@ -74,6 +74,9 @@ type Client struct {
 	UseFullURL bool // Whether to use full URL (without appending /chat/completions)
 	MaxTokens  int  // Maximum tokens for AI response
 
+	ReasoningEffort  string // per-model reasoning/thinking effort ("" = disabled)
+	StrictTruncation bool   // fail-closed on truncated/empty responses (used with reasoning)
+
 	HTTPClient *http.Client // Exported for sub-packages
 	Log        Logger       // Exported for sub-packages
 	Cfg        *Config      // Exported for sub-packages
@@ -130,6 +133,9 @@ func NewClient(opts ...ClientOption) AIClient {
 		HTTPClient: cfg.HTTPClient,
 		Log:        cfg.Logger,
 		Cfg:        cfg,
+
+		ReasoningEffort:  cfg.ReasoningEffort,
+		StrictTruncation: cfg.StrictTruncation,
 	}
 
 	// 4. Set default Provider (if not set)
@@ -252,6 +258,16 @@ func (client *Client) BuildMCPRequestBody(systemPrompt, userPrompt string) map[s
 	} else {
 		requestBody["max_tokens"] = client.MaxTokens
 	}
+
+	// Per-model reasoning effort. This base builder emits the `reasoning_effort`
+	// field, which only the openai provider's chat-completions wire format accepts,
+	// so the provider gate is intentional (the messages-format provider has its own
+	// builder). The whitelist also excludes non-target providers and the empty
+	// value, so an unset/unknown effort leaves the body byte-for-byte unchanged.
+	if client.Provider == ProviderOpenAI && ValidReasoningEffort(client.Provider, client.ReasoningEffort) {
+		requestBody["reasoning_effort"] = client.ReasoningEffort
+	}
+
 	return requestBody
 }
 
@@ -282,6 +298,7 @@ func (client *Client) ParseMCPResponseFull(body []byte) (*LLMResponse, error) {
 				ReasoningContent string     `json:"reasoning_content"`
 				ToolCalls        []ToolCall `json:"tool_calls"`
 			} `json:"message"`
+			FinishReason *string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage struct {
 			PromptTokens     int `json:"prompt_tokens"`
@@ -310,6 +327,21 @@ func (client *Client) ParseMCPResponseFull(body []byte) (*LLMResponse, error) {
 	}
 
 	msg := result.Choices[0].Message
+
+	// Fail-closed on truncation/empty for reasoning-enabled clients: a partial
+	// decision must never be parsed into an order. Non-reasoning clients
+	// (StrictTruncation=false) keep the previous behavior unchanged.
+	if client.StrictTruncation {
+		fr := ""
+		if result.Choices[0].FinishReason != nil {
+			fr = *result.Choices[0].FinishReason
+		}
+		truncated := fr == "length" || fr == "max_tokens" || fr == "max_output_tokens"
+		if err := GuardStrictTruncation(truncated, "finish_reason="+fr, msg.Content, msg.ToolCalls); err != nil {
+			return nil, err
+		}
+	}
+
 	return &LLMResponse{
 		Content:          msg.Content,
 		ReasoningContent: msg.ReasoningContent,

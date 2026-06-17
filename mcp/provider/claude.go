@@ -94,7 +94,7 @@ func (c *ClaudeClient) BuildUrl() string {
 // BuildMCPRequestBody builds the Anthropic wire format for the simple
 // CallWithMessages path (no tool support).
 func (c *ClaudeClient) BuildMCPRequestBody(systemPrompt, userPrompt string) map[string]any {
-	return map[string]any{
+	body := map[string]any{
 		"model":      c.Model,
 		"max_tokens": c.MaxTokens,
 		"system":     systemPrompt,
@@ -102,6 +102,16 @@ func (c *ClaudeClient) BuildMCPRequestBody(systemPrompt, userPrompt string) map[
 			{"role": "user", "content": userPrompt},
 		},
 	}
+
+	// Per-model extended thinking depth. Gated on a validated effort value;
+	// empty/unknown leaves the body unchanged. Temperature is intentionally not
+	// sent on this path (this model rejects the temperature parameter).
+	if mcp.ValidReasoningEffort(mcp.ProviderClaude, c.ReasoningEffort) {
+		body["thinking"] = map[string]any{"type": "adaptive"}
+		body["output_config"] = map[string]any{"effort": c.ReasoningEffort}
+	}
+
+	return body
 }
 
 // BuildRequestBodyFromRequest converts a *Request into the Anthropic Messages
@@ -243,7 +253,8 @@ func (c *ClaudeClient) ParseMCPResponseFull(body []byte) (*mcp.LLMResponse, erro
 			Name  string          `json:"name,omitempty"`
 			Input json.RawMessage `json:"input,omitempty"`
 		} `json:"content"`
-		Usage struct {
+		StopReason string `json:"stop_reason"`
+		Usage      struct {
 			InputTokens  int `json:"input_tokens"`
 			OutputTokens int `json:"output_tokens"`
 		} `json:"usage"`
@@ -275,7 +286,7 @@ func (c *ClaudeClient) ParseMCPResponseFull(body []byte) (*mcp.LLMResponse, erro
 	for _, block := range raw.Content {
 		switch block.Type {
 		case "text":
-			result.Content = block.Text
+			result.Content += block.Text
 
 		case "tool_use":
 			// Input is a JSON object; serialise back to a JSON string so it
@@ -294,5 +305,15 @@ func (c *ClaudeClient) ParseMCPResponseFull(body []byte) (*mcp.LLMResponse, erro
 			})
 		}
 	}
+
+	// Fail-closed on truncation/empty for reasoning-enabled clients: a partial
+	// decision must never be parsed into an order. Non-reasoning clients
+	// (StrictTruncation=false) keep the previous behavior unchanged.
+	if c.StrictTruncation {
+		if err := mcp.GuardStrictTruncation(raw.StopReason == "max_tokens", "stop_reason=max_tokens", result.Content, result.ToolCalls); err != nil {
+			return nil, err
+		}
+	}
+
 	return result, nil
 }

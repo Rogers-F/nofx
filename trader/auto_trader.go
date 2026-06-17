@@ -20,8 +20,18 @@ import (
 	"nofx/trader/lighter"
 	"nofx/trader/okx"
 	"nofx/wallet"
+	"strings"
 	"sync"
 	"time"
+)
+
+// Reasoning/thinking depth tuning applied only to clients that have a valid
+// per-model effort configured. Thinking/reasoning bills into the output budget,
+// so widen max_tokens and the per-request timeout, and reduce retries (a slow
+// effort request must not be retried many times).
+const (
+	reasoningMaxTokens = 16000
+	reasoningTimeout   = 300 * time.Second
 )
 
 func (at *AutoTrader) logTag() string {
@@ -115,10 +125,11 @@ type AutoTraderConfig struct {
 	QwenKey     string
 
 	// Custom AI API configuration
-	CustomAPIURL     string
-	CustomAPIKey     string
-	CustomModelName  string
-	Claw402WalletKey string
+	CustomAPIURL          string
+	CustomAPIKey          string
+	CustomModelName       string
+	CustomReasoningEffort string // per-model reasoning/thinking effort ("" = disabled)
+	Claw402WalletKey      string
 
 	// Scan configuration
 	ScanInterval time.Duration // Scan interval (recommended 3 minutes)
@@ -227,14 +238,37 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		}
 	}
 
+	// Per-model reasoning/thinking depth (opt-in; empty = unchanged behavior).
+	// A valid effort for the target provider widens output budget + timeout,
+	// limits retries, and enables fail-closed truncation handling. An invalid
+	// non-empty value disables reasoning LOUDLY — the trader still runs at its
+	// previous depth and is never halted, so open positions stay managed.
+	var reasoningOpts []mcp.ClientOption
+	reasoningEffort := strings.TrimSpace(config.CustomReasoningEffort)
+	reasoningEnabled := false
+	if reasoningEffort != "" {
+		if mcp.ValidReasoningEffort(aiModel, reasoningEffort) {
+			reasoningOpts = []mcp.ClientOption{
+				mcp.WithReasoningEffort(reasoningEffort),
+				mcp.WithMaxTokens(reasoningMaxTokens),
+				mcp.WithTimeout(reasoningTimeout),
+				mcp.WithMaxRetries(1),
+				mcp.WithStrictTruncation(true),
+			}
+			reasoningEnabled = true
+		} else {
+			logger.Errorf("⚠️ [%s] invalid reasoning_effort %q for provider %q — reasoning DISABLED, trader runs at default depth", config.Name, reasoningEffort, aiModel)
+		}
+	}
+
 	// Create client via registry (covers all registered providers)
 	if aiModel == "custom" {
 		mcpClient = mcp.New()
-	} else if aiModel == "" {
-		aiModel = "deepseek"
-		mcpClient = mcp.NewAIClientByProvider(aiModel)
 	} else {
-		mcpClient = mcp.NewAIClientByProvider(aiModel)
+		if aiModel == "" {
+			aiModel = "deepseek"
+		}
+		mcpClient = mcp.NewAIClientByProvider(aiModel, reasoningOpts...)
 	}
 	if mcpClient == nil {
 		mcpClient = mcp.New()
@@ -248,6 +282,11 @@ func NewAutoTrader(config AutoTraderConfig, st *store.Store, userID string) (*Au
 		mcpClient.SetAPIKey(apiKey, customURL, config.CustomModelName)
 	}
 	logger.Infof("🤖 [%s] Using %s AI", config.Name, aiModel)
+
+	if reasoningEnabled {
+		logger.Infof("🧠 [%s] reasoning enabled: provider=%s model=%s effort=%s max_tokens=%d timeout=%s max_retries=1",
+			config.Name, aiModel, config.CustomModelName, reasoningEffort, reasoningMaxTokens, reasoningTimeout)
+	}
 
 	if config.CustomAPIURL != "" || config.CustomModelName != "" {
 		logger.Infof("🔧 [%s] Custom config - URL: %s, Model: %s", config.Name, config.CustomAPIURL, config.CustomModelName)

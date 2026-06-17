@@ -20,13 +20,17 @@ type Config struct {
 
 	// Behavior configuration
 	MaxTokens   int
-	MaxContext  int     // Model's max context window in tokens (0 = no limit)
+	MaxContext  int // Model's max context window in tokens (0 = no limit)
 	Temperature float64
 	UseFullURL  bool
 
+	// Reasoning / thinking depth (per-model). Empty = disabled (no behavior change).
+	ReasoningEffort  string // e.g. "max" or "xhigh"; translated per provider in the request builder
+	StrictTruncation bool   // fail-closed on truncated/empty responses in the parser (used with reasoning)
+
 	// Retry configuration
-	MaxRetries     int
-	RetryWaitBase  time.Duration
+	MaxRetries      int
+	RetryWaitBase   time.Duration
 	RetryableErrors []string
 
 	// Timeout configuration
@@ -41,11 +45,11 @@ type Config struct {
 func DefaultConfig() *Config {
 	return &Config{
 		// Default values
-		MaxTokens:      getEnvInt("AI_MAX_TOKENS", 2000),
-		Temperature:    MCPClientTemperature,
-		MaxRetries:     MaxRetryTimes,
-		RetryWaitBase:  2 * time.Second,
-		Timeout:        DefaultTimeout,
+		MaxTokens:       getEnvInt("AI_MAX_TOKENS", 2000),
+		Temperature:     MCPClientTemperature,
+		MaxRetries:      MaxRetryTimes,
+		RetryWaitBase:   2 * time.Second,
+		Timeout:         DefaultTimeout,
 		RetryableErrors: retryableErrors,
 
 		// Default dependencies (use global logger)

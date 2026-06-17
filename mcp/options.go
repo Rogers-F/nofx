@@ -15,7 +15,8 @@ type ClientOption func(*Config)
 // WithLogger sets custom logger
 //
 // Usage example:
-//   client := mcp.NewClient(mcp.WithLogger(customLogger))
+//
+//	client := mcp.NewClient(mcp.WithLogger(customLogger))
 func WithLogger(logger Logger) ClientOption {
 	return func(c *Config) {
 		c.Logger = logger
@@ -29,8 +30,9 @@ func WithLogger(logger Logger) ClientOption {
 // these protections. Only use in tests or with a client providing equivalent safeguards.
 //
 // Usage example:
-//   httpClient := &http.Client{Timeout: 60 * time.Second}
-//   client := mcp.NewClient(mcp.WithHTTPClient(httpClient))
+//
+//	httpClient := &http.Client{Timeout: 60 * time.Second}
+//	client := mcp.NewClient(mcp.WithHTTPClient(httpClient))
 func WithHTTPClient(client *http.Client) ClientOption {
 	return func(c *Config) {
 		c.HTTPClient = client
@@ -44,7 +46,8 @@ func WithHTTPClient(client *http.Client) ClientOption {
 // WithTimeout sets request timeout duration
 //
 // Usage example:
-//   client := mcp.NewClient(mcp.WithTimeout(60 * time.Second))
+//
+//	client := mcp.NewClient(mcp.WithTimeout(60 * time.Second))
 func WithTimeout(timeout time.Duration) ClientOption {
 	return func(c *Config) {
 		c.Timeout = timeout
@@ -55,7 +58,8 @@ func WithTimeout(timeout time.Duration) ClientOption {
 // WithMaxRetries sets maximum retry count
 //
 // Usage example:
-//   client := mcp.NewClient(mcp.WithMaxRetries(5))
+//
+//	client := mcp.NewClient(mcp.WithMaxRetries(5))
 func WithMaxRetries(maxRetries int) ClientOption {
 	return func(c *Config) {
 		c.MaxRetries = maxRetries
@@ -65,7 +69,8 @@ func WithMaxRetries(maxRetries int) ClientOption {
 // WithRetryWaitBase sets base retry wait duration
 //
 // Usage example:
-//   client := mcp.NewClient(mcp.WithRetryWaitBase(3 * time.Second))
+//
+//	client := mcp.NewClient(mcp.WithRetryWaitBase(3 * time.Second))
 func WithRetryWaitBase(waitTime time.Duration) ClientOption {
 	return func(c *Config) {
 		c.RetryWaitBase = waitTime
@@ -79,7 +84,8 @@ func WithRetryWaitBase(waitTime time.Duration) ClientOption {
 // WithMaxTokens sets maximum token count
 //
 // Usage example:
-//   client := mcp.NewClient(mcp.WithMaxTokens(4000))
+//
+//	client := mcp.NewClient(mcp.WithMaxTokens(4000))
 func WithMaxTokens(maxTokens int) ClientOption {
 	return func(c *Config) {
 		c.MaxTokens = maxTokens
@@ -102,7 +108,8 @@ func WithMaxContext(maxContext int) ClientOption {
 // WithTemperature sets temperature parameter
 //
 // Usage example:
-//   client := mcp.NewClient(mcp.WithTemperature(0.7))
+//
+//	client := mcp.NewClient(mcp.WithTemperature(0.7))
 func WithTemperature(temperature float64) ClientOption {
 	return func(c *Config) {
 		c.Temperature = temperature
@@ -155,7 +162,8 @@ func WithUseFullURL(useFullURL bool) ClientOption {
 // WithDeepSeekConfig sets DeepSeek configuration
 //
 // Usage example:
-//   client := mcp.NewClient(mcp.WithDeepSeekConfig("sk-xxx"))
+//
+//	client := mcp.NewClient(mcp.WithDeepSeekConfig("sk-xxx"))
 func WithDeepSeekConfig(apiKey string) ClientOption {
 	return func(c *Config) {
 		c.Provider = ProviderDeepSeek
@@ -168,7 +176,8 @@ func WithDeepSeekConfig(apiKey string) ClientOption {
 // WithQwenConfig sets Qwen configuration
 //
 // Usage example:
-//   client := mcp.NewClient(mcp.WithQwenConfig("sk-xxx"))
+//
+//	client := mcp.NewClient(mcp.WithQwenConfig("sk-xxx"))
 func WithQwenConfig(apiKey string) ClientOption {
 	return func(c *Config) {
 		c.Provider = ProviderQwen
@@ -189,5 +198,30 @@ func WithMiniMaxConfig(apiKey string) ClientOption {
 		c.APIKey = apiKey
 		c.BaseURL = DefaultMiniMaxBaseURL
 		c.Model = DefaultMiniMaxModel
+	}
+}
+
+// ============================================================
+// Reasoning / Thinking Options
+// ============================================================
+
+// WithReasoningEffort sets the per-model reasoning/thinking effort (e.g. "max"
+// or "xhigh"). Empty disables injection (default behavior). The request builders
+// translate it per provider (messages format: thinking + output_config.effort;
+// chat-completions format: reasoning_effort) and ignore values not in the
+// provider's whitelist.
+func WithReasoningEffort(effort string) ClientOption {
+	return func(c *Config) {
+		c.ReasoningEffort = effort
+	}
+}
+
+// WithStrictTruncation enables fail-closed handling of truncated or empty
+// responses in the parser (stop_reason/finish_reason == max_tokens/length, or
+// empty content -> error). Used for reasoning-enabled trading clients so a
+// partial decision is never parsed into an order.
+func WithStrictTruncation(strict bool) ClientOption {
+	return func(c *Config) {
+		c.StrictTruncation = strict
 	}
 }

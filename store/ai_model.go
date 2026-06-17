@@ -27,6 +27,7 @@ type AIModel struct {
 	APIKey          crypto.EncryptedString `gorm:"column:api_key;default:''" json:"apiKey"`
 	CustomAPIURL    string                 `gorm:"column:custom_api_url;default:''" json:"customApiUrl"`
 	CustomModelName string                 `gorm:"column:custom_model_name;default:''" json:"customModelName"`
+	ReasoningEffort string                 `gorm:"column:reasoning_effort;not null;default:''" json:"reasoningEffort"`
 	CreatedAt       time.Time              `json:"created_at"`
 	UpdatedAt       time.Time              `json:"updated_at"`
 }
